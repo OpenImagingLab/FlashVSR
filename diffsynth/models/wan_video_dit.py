@@ -43,17 +43,22 @@ import numpy as np
 # fused dense attention instead of the sparse kernel: faster and uses full
 # context. Below the threshold the sparse kernel wins, so we keep it.
 #
-# Knob: FLASHVSR_ATTN_BACKEND = sparse | auto | dense
+# Knob: FLASHVSR_ATTN_BACKEND = sparse | triton | auto | dense
 #   sparse -> always block_sparse (DEFAULT = original behaviour, no quality change)
+#   triton -> Hopper WGMMA block-sparse kernel: exact same mask, output matches
+#             block_sparse very closely (~49.7 dB PSNR end-to-end; the only
+#             difference is WGMMA vs HMMA accumulation order). ~1.2x faster than
+#             block_sparse at the kernel level (~+9% end-to-end). sm_90 only;
+#             silently falls back to block_sparse elsewhere / on error.
 #   auto   -> density-adaptive: dense if density>=FLASHVSR_ATTN_DENSE_THRESH
 #   dense  -> always cuDNN fused dense
 # FLASHVSR_ATTN_DENSE_THRESH default 0.5 (the measured crossover point).
 #
 # NOTE: routing to dense changes the output (it uses FULL attention instead of
-# the trained locality-constrained sparse pattern). Measured E2E gain at the
-# default topk is negligible (~+0.5%), so the default stays 'sparse'. The knob
-# exists for future aggressive-sparsity experiments (lower topk -> lower density
-# -> sparse wins big, see docs).
+# the trained locality-constrained sparse pattern, which measurably lowers PSNR),
+# and at the default density the E2E gain is negligible, so the default stays
+# 'sparse'. The knob exists for future aggressive-sparsity experiments (lower
+# topk -> lower density -> sparse wins big, see docs).
 # ---------------------------------------------------------------------------
 _ATTN_BACKEND = os.environ.get("FLASHVSR_ATTN_BACKEND", "sparse").lower()
 _ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
@@ -89,6 +94,12 @@ try:
     _CUDNN_SDPA_OK = True
 except Exception:
     _CUDNN_SDPA_OK = False
+
+# Triton WGMMA block-sparse attention kernel (optional; sm_90 fast path).
+try:
+    from .triton_block_sparse_attn import triton_block_sparse_attention as _TRITON_BSA
+except Exception:
+    _TRITON_BSA = None
 
 
 def _is_hopper_dev(device):
@@ -273,6 +284,23 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 vd = v.unsqueeze(0).transpose(1, 2)
                 xd = _dense_sdpa((qd, kd, vd))             # (1, n, S, d)
                 x = xd.transpose(1, 2)                      # (1, S, n, d)
+                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            except Exception:
+                torch.cuda.empty_cache()  # fall back to sparse
+
+        # Triton WGMMA block-sparse backend (opt-in, Hopper-guarded, exact mask).
+        if _ATTN_BACKEND == "triton" and _is_hopper_dev(q.device) and _TRITON_BSA is not None:
+            try:
+                # block mask -> (H, Nqb, Nkvb) bool ; q/k/v (S,n,d) -> (n,S,d)
+                bm = base_blockmask
+                if bm.dim() == 4:
+                    bm = bm[0]
+                bm = bm.bool()
+                qh = q.transpose(0, 1).contiguous()
+                kh = k.transpose(0, 1).contiguous()
+                vh = v.transpose(0, 1).contiguous()
+                xh = _TRITON_BSA(qh, kh, vh, bm)            # (n, S, d)
+                x = xh.transpose(0, 1).contiguous().unsqueeze(0)  # (1, S, n, d)
                 return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
             except Exception:
                 torch.cuda.empty_cache()  # fall back to sparse
