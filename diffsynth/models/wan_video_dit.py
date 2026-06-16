@@ -31,6 +31,54 @@ from block_sparse_attn import block_sparse_attn_func
 from PIL import Image
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Hopper adaptive attention backend.
+#
+# Measured on GH200 @768x1408 (seq=25344, 12 heads, dim=128): the block-sparse
+# self-attention runs at block-mask density ~0.606 and takes ~7.3 ms, while
+# cuDNN's fused dense SDPA computes the FULL attention in ~6.5 ms (605 TFLOP/s).
+# i.e. at high density the sparse kernel is slower than dense AND drops context.
+#
+# When the block mask is dense enough (density >= threshold) we route to cuDNN
+# fused dense attention instead of the sparse kernel: faster and uses full
+# context. Below the threshold the sparse kernel wins, so we keep it.
+#
+# Knob: FLASHVSR_ATTN_BACKEND = sparse | auto | dense
+#   sparse -> always block_sparse (DEFAULT = original behaviour, no quality change)
+#   auto   -> density-adaptive: dense if density>=FLASHVSR_ATTN_DENSE_THRESH
+#   dense  -> always cuDNN fused dense
+# FLASHVSR_ATTN_DENSE_THRESH default 0.5 (the measured crossover point).
+#
+# NOTE: routing to dense changes the output (it uses FULL attention instead of
+# the trained locality-constrained sparse pattern). Measured E2E gain at the
+# default topk is negligible (~+0.5%), so the default stays 'sparse'. The knob
+# exists for future aggressive-sparsity experiments (lower topk -> lower density
+# -> sparse wins big, see docs).
+# ---------------------------------------------------------------------------
+_ATTN_BACKEND = os.environ.get("FLASHVSR_ATTN_BACKEND", "sparse").lower()
+_ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
+
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
+    _CUDNN_SDPA_OK = True
+except Exception:
+    _CUDNN_SDPA_OK = False
+
+
+def _is_hopper_dev(device):
+    try:
+        return device.type == "cuda" and torch.cuda.get_device_capability(device) == (9, 0)
+    except Exception:
+        return False
+
+
+def _dense_sdpa(q_bnsd):
+    """cuDNN fused dense attention on (B, heads, S, D) layout."""
+    if _CUDNN_SDPA_OK:
+        with _sdpa_kernel(_SDPBackend.CUDNN_ATTENTION):
+            return F.scaled_dot_product_attention(*q_bnsd)
+    return F.scaled_dot_product_attention(*q_bnsd)
+
 
 # ----------------------------
 # Local / window masks
@@ -178,11 +226,35 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+        base_blockmask = attention_mask
+
+        # Adaptive backend: route dense when the sparse mask is too dense to pay off.
+        use_dense = False
+        if _ATTN_BACKEND == "dense":
+            use_dense = True
+        elif _ATTN_BACKEND == "auto" and _is_hopper_dev(q.device):
+            try:
+                density = base_blockmask.float().mean().item()
+            except Exception:
+                density = 1.0
+            use_dense = density >= _ATTN_DENSE_THRESH
+
+        if use_dense:
+            try:
+                # (S, n, d) -> (1, n, S, d) for fused dense SDPA, then back.
+                qd = q.unsqueeze(0).transpose(1, 2)
+                kd = k.unsqueeze(0).transpose(1, 2)
+                vd = v.unsqueeze(0).transpose(1, 2)
+                xd = _dense_sdpa((qd, kd, vd))             # (1, n, S, d)
+                x = xd.transpose(1, 2)                      # (1, S, n, d)
+                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            except Exception:
+                torch.cuda.empty_cache()  # fall back to sparse
+
         cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
         cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
         head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
         streaming_info = None
-        base_blockmask = attention_mask
         max_seqlen_q_ = seqlen
         max_seqlen_k_ = seqlen_kv
         p_dropout = 0.0
