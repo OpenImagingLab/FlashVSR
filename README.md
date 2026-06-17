@@ -187,6 +187,40 @@ python infer_flashvsr_v1.1_tiny_long_video.py
 
 ---
 
+### ⚡ Hopper Acceleration (optional, GH200 / sm_90)
+
+FlashVSR ships a set of **opt-in** fast paths for NVIDIA Hopper GPUs (e.g. GH200, `sm_90`). They are controlled by environment variables and are **all OFF by default**: with no variables set, the output is **bit-for-bit identical** to the standard path and Ampere / A100 are unaffected. Each path is guarded to `sm_90` and silently falls back to the original kernel elsewhere or on any error.
+
+On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~38 FPS (about 2.3x)**.
+
+| Env var | Values | Default | Effect |
+|---|---|---|---|
+| `FLASHVSR_CONV3D_BACKEND` | `auto`, `gemm` | `auto` | `gemm` = im2col + WGMMA conv3d for the LQ projector (largest single win) |
+| `FLASHVSR_TCDECODER_CHANNELS_LAST` | `0`, `1` | `0` | NHWC TCDecoder (bit-identical) |
+| `FLASHVSR_FUSE_NORM` | `0`, `1` | `0` | fuse norm / modulate / gate via `torch.compile` |
+| `FLASHVSR_ATTN_BACKEND` | `sparse`, `triton`, `auto`, `dense` | `sparse` | `triton` = Hopper WGMMA block-sparse kernel (same mask) |
+| `FLASHVSR_ATTN_TMA` | `0`, `1` | `1` | TMA bulk loads (only used by the `triton` backend) |
+| `FLASHVSR_CONV3D_IM2COL_BUDGET_GB` | float | `2.0` | chunked im2col memory budget for the `gemm` backend |
+| `FLASHVSR_CACHE_MOD` | `0`, `1` | `0` | cache step-invariant modulation (bit-identical) |
+| `FLASHVSR_CACHE_MASK_BIAS` | `0`, `1` | `0` | cache the geometry-only attention bias (bit-identical) |
+
+**Recommended full-speed config** (run from `examples/WanVSR`):
+
+```bash
+FLASHVSR_CONV3D_BACKEND=gemm \
+FLASHVSR_TCDECODER_CHANNELS_LAST=1 \
+FLASHVSR_FUSE_NORM=1 \
+FLASHVSR_ATTN_BACKEND=triton \
+python infer_flashvsr_v1.1_tiny.py
+```
+
+> **Notes**
+> - The `triton` backend and the `gemm` conv3d require a Hopper GPU (`sm_90`); on other GPUs they fall back to the default path automatically.
+> - `channels_last`, `CACHE_MOD` and `CACHE_MASK_BIAS` are bit-identical (`max|diff| = 0`). `FUSE_NORM` and the `triton` backend are near-identical (~49-50 dB PSNR vs the default), not bit-exact, due to fp/accumulation order, so they are opt-in.
+> - Parity + speed for each path can be checked with the `examples/WanVSR/test_*.py` scripts.
+
+---
+
 ### 🛠️ Method
 
 The overview of **FlashVSR**. This framework features:
