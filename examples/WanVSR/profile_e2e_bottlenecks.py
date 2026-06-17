@@ -46,11 +46,15 @@ def build_lq(src, device="cuda", dtype=torch.bfloat16):
 
 def categorize(name):
     n = name.lower()
-    # attention kernels
-    if any(k in n for k in ["fmha", "flash", "attention", "softmax", "scaled_dot", "mha", "block_sparse"]):
+    # attention kernels (incl. Triton WGMMA block-sparse kernel _bsfa[_tma]_kernel
+    # and the bundled block_sparse_attn CUDA kernel)
+    if any(k in n for k in ["fmha", "flash", "attention", "softmax", "scaled_dot", "mha",
+                            "block_sparse", "_bsfa", "bsfa_"]):
         return "attention"
-    # cuDNN convolution (TCDecoder conv2d, etc.), NOT the gemm-conv path
-    if "cudnn_convolution" in n or "implicit_gemm" in n or ("conv" in n and "convolution" in n):
+    # cuDNN convolution (TCDecoder conv2d, etc.), NOT the gemm-conv path.
+    # Note sm90_xmma_fprop_implicit_gemm is cuDNN conv (TCDecoder), not a linear GEMM.
+    if ("cudnn_convolution" in n or "implicit_gemm" in n or "xmma_fprop" in n
+            or "xmma_wgrad" in n or ("conv" in n and "convolution" in n)):
         return "conv (cudnn, TCDecoder)"
     # explicit GEMM (linear/qkv/ffn + our im2col conv -> addmm/nvjet/cublas)
     if any(k in n for k in ["nvjet", "gemm", "cutlass", "wgmma", "cublas", "addmm", "matmul", "linear"]):

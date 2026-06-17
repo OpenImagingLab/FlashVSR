@@ -80,6 +80,23 @@ _ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
 # ---------------------------------------------------------------------------
 _FUSE_NORM = os.environ.get("FLASHVSR_FUSE_NORM", "0") != "0"
 
+# ---------------------------------------------------------------------------
+# Lossless step-invariant caches (Phase B).
+#
+# Several per-block elementwise results are recomputed on every denoise step but
+# depend only on fixed inputs (parameters + the once-computed timestep modulation
+# t_mod), NOT on x / q / k. Caching them is bit-identical (max|diff|==0).
+#
+# B1  FLASHVSR_CACHE_MOD       = 0 | 1  -> cache (modulation + t_mod).chunk(...)
+#                                          per DiTBlock / Head.
+# B2  FLASHVSR_CACHE_MASK_BIAS = 0 | 1  -> cache the local_attn_mask additive bias
+#                                          (0/-inf) in generate_draft_block_mask.
+# Both default OFF (opt-in), pure elementwise, silent fallback. They do not touch
+# attention / the streaming cache, so they compose with every other knob.
+# ---------------------------------------------------------------------------
+_CACHE_MOD = os.environ.get("FLASHVSR_CACHE_MOD", "0") != "0"
+_CACHE_MASK_BIAS = os.environ.get("FLASHVSR_CACHE_MASK_BIAS", "0") != "0"
+
 
 def _maybe_compile(fn):
     if not _FUSE_NORM:
@@ -197,6 +214,23 @@ class WindowPartition3D:
         return x.view(B, F, H, W, -1)
 
 
+# B2: process-wide cache for the geometry-only additive attention bias.
+_MASK_BIAS_CACHE = {}
+
+
+def _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num):
+    """Build the (repeat_head, S, S) 0/-inf additive bias from the boolean local
+    block mask. Exact re-expression of the original inline code (lines below) so
+    cached and uncached paths are bit-identical."""
+    m = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
+    m = rearrange(m, 'x a y b -> (x a) (y b)')
+    m = m.unsqueeze(0).repeat(repeat_head, 1, 1)
+    m = m.to(torch.float32)
+    m = m.masked_fill(m == False, -float('inf'))
+    m = m.masked_fill(m == True, 0)
+    return m
+
+
 @torch.no_grad()
 def generate_draft_block_mask(batch_size, nheads, seqlen,
                               q_w, k_w, topk=10, local_attn_mask=None):
@@ -214,13 +248,22 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     repeat_head = scores.shape[0]
     repeat_len = scores.shape[1] // local_attn_mask.shape[0]
     repeat_num = scores.shape[2] // local_attn_mask.shape[1]
-    local_attn_mask = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
-    local_attn_mask = rearrange(local_attn_mask, 'x a y b -> (x a) (y b)')
-    local_attn_mask = local_attn_mask.unsqueeze(0).repeat(repeat_head, 1, 1)
-    local_attn_mask = local_attn_mask.to(torch.float32)
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == False, -float('inf'))
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == True, 0)
-    scores = scores + local_attn_mask
+
+    # B2 lossless cache: the additive bias (0 / -inf) depends only on the geometry
+    # (local_attn_mask + repeat factors), not on q/k, so it is identical across
+    # every block and every step. Recomputing it (repeat + 2x masked_fill + cast)
+    # each call is pure overhead. Cache it keyed on those shape-only inputs.
+    bias = None
+    if _CACHE_MASK_BIAS:
+        key = (id(local_attn_mask), repeat_head, repeat_len, repeat_num,
+               local_attn_mask.device, scores.shape[1], scores.shape[2])
+        bias = _MASK_BIAS_CACHE.get(key)
+        if bias is None:
+            bias = _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num)
+            _MASK_BIAS_CACHE[key] = bias
+    if bias is None:
+        bias = _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num)
+    scores = scores + bias
 
     attn_map = torch.softmax(scores, dim=-1)
     attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen)
@@ -603,12 +646,24 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
+        # B1 lossless cache: (modulation + t_mod).chunk(6) is step-invariant.
+        self._mod_cache = None
+        self._mod_cache_key = None
 
     def forward(self, x, context, t_mod, freqs, f, h, w, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+        if _CACHE_MOD:
+            key = (id(t_mod), t_mod.dtype, t_mod.device)
+            if self._mod_cache_key != key:
+                self._mod_cache = (
+                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+                ).chunk(6, dim=1)
+                self._mod_cache_key = key
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._mod_cache
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
             input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
@@ -652,9 +707,21 @@ class Head(nn.Module):
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+        # B1 lossless cache: (modulation + t_mod).chunk(2) is step-invariant.
+        self._mod_cache = None
+        self._mod_cache_key = None
 
     def forward(self, x, t_mod):
-        shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+        if _CACHE_MOD:
+            key = (id(t_mod), t_mod.dtype, t_mod.device)
+            if self._mod_cache_key != key:
+                self._mod_cache = (
+                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+                ).chunk(2, dim=1)
+                self._mod_cache_key = key
+            shift, scale = self._mod_cache
+        else:
+            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
 
