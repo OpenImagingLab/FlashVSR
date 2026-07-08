@@ -568,9 +568,18 @@ stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
   same optimistic 0.9 ms/call extrapolation. Follow-ups: (1) re-measure `FLASHVSR_DECODER_OVERLAP`
   co-execution on top of triton2 (v2 still occupies 229 KB smem/SM, so the
   34% co-execution ceiling probably persists — measure, don't assume);
-  (2) long_sb 2.00/wait 1.32 in v2 are now the top stalls (TMA-latency
-  bound at the ring head) — NBUF=4 needs BLOCK_N=64 smem or Q-in-regs to
-  fit, which is Phase-4-adjacent tuning; (3) FP8 attention (Phase 4) now
+  (2) **CORRECTION (PC-sampling, 335k samples, source page):** the aggregate
+   `long_sb=2.00` label is a warp-state classification artifact of the producer
+   warps parked on mbarriers — it is NOT the real limiter. Per-PC sampling
+   attributes warp-time as ~59% softmax f32/MUFU chain (MUFU.EX2 18.9% +
+   FMNMX 14.9% + FADD 12.0% + FMUL 9.7% + F2FP 1.9% + SHFL 2.0%) and ~24%
+   wgmma (HGMMA issue 13.6% + WARPGROUP.DEPBAR 10.0%); producer/TMA/LDG/
+   mbarrier PCs are <1%. The kernel is **softmax-math + wgmma-wait bound, NOT
+   TMA/ring-head bound** — deeper KV prefetch (NBUF) buys nothing; the levers
+   are FFMA-form exp2 (fold `qk*s - m*s` into one FFMA), an alpha==1 bit-exact
+   rescale skip, and explicit pingpong ordering so softmax(WG-A) overlaps
+   HGMMA(WG-B). Isolated 1.139 ms = 95% of the 1.085 ms ideal-sparse ceiling;
+   perfect softmax/wgmma overlap floor ≈ 0.95–1.0 ms in-pipe. (3) FP8 attention (Phase 4) now
   has a WS substrate to build on.
 
 ### Entry template (copy-paste per attempt)
