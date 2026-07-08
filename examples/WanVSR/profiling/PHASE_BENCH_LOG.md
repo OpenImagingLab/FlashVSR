@@ -66,6 +66,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 3.5-2 | Fused CSR build (sort-free cumsum-scatter) | `FLASHVSR_FUSED_CSR` | 46.112 | 46.383 | +0.59% | 119.92 ms | 118.84 ms | 15.62 GiB | 15.62 GiB | idx[0:cnt]+cnt bit-eq vs argsort (all densities+degenerate); v2 output max\|diff\|=0 | keep-behind-flag (lossless; recommended-with-triton2) |
 | 2026-07-08 | 3.5-3 | Decoder overlap × v2 remeasure | `FLASHVSR_DECODER_OVERLAP` | 46.383 | 47.239 | +1.85% | 118.84 ms | 172.9 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | inherited lossless (2B-1, backend-orthogonal); tail 543→126 ms | keep-behind-flag (co-exec 31.7% vs 34.1%; v2 did NOT free the ceiling) |
 | 2026-07-08 | 3.5-4 | RoPE freqs device cache × v2 remeasure | `FLASHVSR_CACHE_ROPE_FREQS` | 46.383 | 46.429 | +0.10% (noise) | 118.84 ms | 118.40 ms | 15.62 GiB | 15.65 GiB | lossless (2A-1a) | keep-behind-flag (still FPS-neutral @768 under v2) |
+| 2026-07-08 | 4A | RoPE fp32 (fused apply) | `FLASHVSR_ROPE_FP32` (reverted) | — | — | ~0 (x1.01 isolated) | — | — | — | — | ≤1 bf16 ULP (numerically fine) | **drop** (no speedup — rope is interleave-access-bound at ~400 GB/s, not fp64-bound) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -650,6 +651,22 @@ smem-bound, not backend-bound — a real Phase-4/5 dependency: only freeing v2's
 229 KB smem would raise co-execution). Recommended-set delta for the campaign:
 promote `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1` after the
 second confirming entry.
+
+#### 2026-07-08 · Phase 4A · RoPE fp32 → DROP (measured perf-neutral)
+
+- Hypothesis (roadmap): rope 8.6 ms/chunk is fp64-ALU-bound; fp32 → ~1.7 ms.
+- Implemented `_rope_apply_fused_fp32_impl` + `FLASHVSR_ROPE_FP32`; isolated
+  A/B at the real shape (1×8448×1536, freqs 8448×1×64): fp64 127.9 µs vs fp32
+  126.3 µs = **x1.01 (noise)**. Numerics fine (≤1 bf16 ULP, ~99.99% bit-equal).
+- Root cause: the fused RoPE kernel already moves only bf16 in/out with the
+  fp64 freqs downcast in-register; at 52 MB / 128 µs it runs at ~400 GB/s
+  (~12% of HBM3) — it is neither fp64-compute nor BW bound but bound by the
+  **strided interleave write pattern** (`torch.stack((o_r,o_i),-1)` + flatten
+  → stride-2 uncoalesced stores). Precision does not touch that, so fp32 buys
+  nothing. Reverted (no flag left).
+- Real rope lever (deferred, numerics-neutral candidate): restructure the
+  interleave so the complex pairs are written coalesced (or fold RoPE into the
+  attention/qkv prologue). Not fp32. Filed for a later structural pass.
 
 ### Entry template (copy-paste per attempt)
 
