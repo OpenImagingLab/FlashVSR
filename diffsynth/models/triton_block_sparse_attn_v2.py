@@ -55,6 +55,60 @@ except Exception as e:  # pragma: no cover
 
 from .triton_block_sparse_attn import _make_csr
 
+# ---------------------------------------------------------------------------
+# Phase 3.5-2: fused CSR build (FLASHVSR_FUSED_CSR, default OFF).
+#
+# `_make_csr` uses torch.argsort(descending, stable) — a full radix sort
+# (radixSortKVInPlace ~0.71 ms/chunk in-pipe) — only to move the True
+# kv-blocks to the front in ascending order. The v2 kernel reads only
+# idx[0:cnt], so a single-pass cumsum-scatter reproduces idx[0:cnt] and cnt
+# bit-identically without a sort. Lossless (idx[0:cnt] + cnt equal to the
+# argsort path; the unused tail idx[cnt:] is never read).
+# ---------------------------------------------------------------------------
+_FUSED_CSR = os.environ.get("FLASHVSR_FUSED_CSR", "0") != "0"
+
+if _V2_OK:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _csr_scan_kernel(BM, IDX, CNT, R, NKVB,
+                         sbr, sbn, sir, sin_, scr,
+                         BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+        valid = offs < NKVB
+        m = tl.load(BM + row * sbr + offs * sbn, mask=valid, other=0).to(tl.int32)
+        # inclusive prefix sum -> write slot of each True block; ascending offs
+        # -> ascending slots -> idx[0:cnt] holds True kv-blocks in ascending
+        # order (== argsort(descending, stable)[0:cnt]).
+        pos = tl.cumsum(m, axis=0) - 1
+        cnt = tl.sum(m, axis=0)
+        keep = (m > 0) & valid
+        tl.store(IDX + row * sir + pos * sin_, offs.to(tl.int32), mask=keep)
+        tl.store(CNT + row * scr, cnt)
+
+
+def _make_csr_fused(bm):
+    """Sort-free CSR: (H,Nqb,Nkvb) bool -> (idx int32, cnt int32).
+
+    idx[0:cnt] and cnt are bit-identical to `_make_csr`; the tail idx[cnt:]
+    (never consumed by the kernel) is left uninitialized.
+    """
+    H, Nqb, Nkvb = bm.shape
+    R = H * Nqb
+    bmf = bm.reshape(R, Nkvb)
+    idx = torch.empty(R, Nkvb, dtype=torch.int32, device=bm.device)
+    cnt = torch.empty(R, dtype=torch.int32, device=bm.device)
+    BLOCK = max(16, triton.next_power_of_2(Nkvb))
+    bmi = bmf.to(torch.int8)
+    _csr_scan_kernel[(R,)](
+        bmi, idx, cnt, R, Nkvb,
+        bmi.stride(0), bmi.stride(1), idx.stride(0), idx.stride(1), cnt.stride(0),
+        BLOCK=BLOCK)
+    return idx.view(H, Nqb, Nkvb), cnt.view(H, Nqb)
+
+
 # Ring depth for the K/V shared-memory pipeline. NBUF=3 fits in 227 KB with
 # BLOCK_M=BLOCK_N=D=128 (Q 32K + 3x(K 32K + V 32K)); measured fastest
 # (sweep in PHASE_BENCH_LOG Phase 3).
@@ -272,7 +326,7 @@ def _build_call(q, k, v, bm, sm_scale, BLOCK_M=128, BLOCK_N=None):
         # exact refinement: every 128-wide mask block is covered by
         # 128/BLOCK_N consecutive tiles inheriting the same mask bit
         bm = bm.repeat_interleave(128 // BLOCK_N, dim=2)
-    idx, cnt = _make_csr(bm)
+    idx, cnt = _make_csr_fused(bm) if _FUSED_CSR else _make_csr(bm)
     assert idx.stride(2) == 1  # producer walks the index list contiguously
     o = torch.empty_like(q)
     scale_log2e = float(sm_scale) * 1.4426950408889634
