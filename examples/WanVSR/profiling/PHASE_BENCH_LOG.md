@@ -54,6 +54,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-2 | KV cache arena (no per-chunk cat) | `FLASHVSR_KV_RINGBUF` | 39.023 | 39.429 | +1.04% | 153.62 ms | 150.76 ms | 12.60 GiB | 15.50 GiB | max\|diff\|=0 over 9 chunks | keep-enabled |
 | 2026-07-08 | 2A-3 | Attention strided IO (no transposes) | `FLASHVSR_ATTN_STRIDED_IO` | 39.429 | 41.099 | +4.24% | 150.76 ms | 141.14 ms | 15.50 GiB | 15.50 GiB | kernel + E2E max\|diff\|=0 | keep-enabled |
 | 2026-07-08 | 2A-4 | mask_gen lean (kthvalue + no repeat + seqlens cache) | `FLASHVSR_MASKGEN_LEAN` | 41.099 | 41.477 | +0.92% | 141.14 ms | 139.00 ms | 15.50 GiB | 15.50 GiB | mask equality + E2E max\|diff\|=0 | keep-enabled |
+| 2026-07-08 | 2A-5 | LQ projector lean (pad fold + no clones) | `FLASHVSR_LQPROJ_LEAN` | 41.477 | 41.580 | +0.25% | 139.00 ms | 138.46 ms | 15.50 GiB | 15.62 GiB | E2E max\|diff\|=0 (after dropping sub-item b) | keep-enabled |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -190,6 +191,36 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   `>` compare untouched. The remaining ~5 ms of the mask_gen chain needs the
   fused top-k kernel (Phase 2B-3), not more hygiene.
 
+#### 2026-07-08 11:10 · Phase 2A-5 · LQ projector allocation/layout cleanup
+
+- Commit / patch: phase2a lq projector lean
+- Files changed: `examples/WanVSR/utils/utils.py` (`CausalConv3d._forward_lean`,
+  `_conv3d_gemm(contig_out=)`, `Causal_LQ4x_Proj.stream_forward`)
+- Flag: `FLASHVSR_LQPROJ_LEAN` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1 ATTN_STRIDED_IO=1 MASKGEN_LEAN=1`) + flag under test
+- Exact benchmark command: §0.4 primary + kept set + `FLASHVSR_LQPROJ_LEAN=1`
+- Resolution / frames: 768x1408 / F=81
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.477 → 41.580 (+0.25%) — 3-run medians
+- Steady chunk before → after (Δ): 139.00 → 138.46 ms (−0.54 ms, ~noise floor)
+- Peak mem before → after: 15.50 → 15.62 GiB (persistent pad buffers + view retention)
+- Correctness: E2E `test_phase2a_lossless.py LQPROJ_LEAN` → max|diff| == 0
+  across a full clip (streaming cache exercised across chunk boundaries)
+- Sub-item REJECTED during development: skipping the GEMM output
+  `.contiguous()` (layout-only in values) changed `F.normalize`'s reduction
+  accumulation order → measured max|diff|=0.397 / PSNR 49.9 dB, which
+  violates this item's lossless gate. Dropped; documented in code. Could be
+  revisited under a Phase-4 numerics-tolerant gate if the projector becomes
+  hot again.
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: the kept copies-only cleanup (fold cat+F.pad into one
+  buffer write, drop streaming-cache clones) recovers ~0.5 ms of the ~1–2 ms
+  estimate — pad+cat was only ~8% of the projector path, and the addmm (65%)
+  and im2col gather (29%) are untouched by design. Since 2A-5 recovered
+  <2 ms, the roadmap gate keeps Phase 2B-4 (fused im2col-GEMM) on the table.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -227,6 +258,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2 | + KV_RINGBUF | 39.429 | 150.76 ms | 15.5 GiB | +2.19% FPS / −5.52 ms | 2A-2, lossless; +2.9 GiB arena slack |
 | 3 | + ATTN_STRIDED_IO | 41.099 | 141.14 ms | 15.5 GiB | +6.52% FPS / −15.14 ms | 2A-3, lossless |
 | 4 | + MASKGEN_LEAN | 41.477 | 139.00 ms | 15.5 GiB | +7.50% FPS / −17.28 ms | 2A-4, exact mask |
+| 5 | + LQPROJ_LEAN | 41.580 | 138.46 ms | 15.62 GiB | +7.76% FPS / −17.82 ms | 2A-5, lossless |
 
 ---
 

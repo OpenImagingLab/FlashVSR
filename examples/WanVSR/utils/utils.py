@@ -50,6 +50,23 @@ _CONV3D_IM2COL_BUDGET_GB = float(
     os.environ.get("FLASHVSR_CONV3D_IM2COL_BUDGET_GB", "2.0")
 )
 
+# ---------------------------------------------------------------------------
+# Phase 2A-5: LQ projector layout/allocation cleanup (FLASHVSR_LQPROJ_LEAN,
+# default OFF). Keeps the im2col+GEMM path (mandatory on Hopper, see docs);
+# removes avoidable materializations around it:
+#   (a) the causal pad is built with slice writes into a persistent per-conv
+#       buffer (interior + streaming-cache frames + replicate borders) instead
+#       of torch.cat -> F.pad, which materializes the full tensor twice;
+#   (b) [REJECTED — see note in _forward_lean] skipping the GEMM output
+#       .contiguous() changes F.normalize's reduction accumulation order
+#       (measured 49.9 dB, violates the lossless gate for this item);
+#   (c) the streaming cache slices in Causal_LQ4x_Proj.stream_forward keep
+#       views instead of .clone() copies (sources are never mutated in place;
+#       the pad write in (a) copies from them at the same values).
+# (a)+(c) are copies-only changes: gated on E2E max|diff| == 0 across a clip.
+# ---------------------------------------------------------------------------
+_LQPROJ_LEAN = os.environ.get("FLASHVSR_LQPROJ_LEAN", "0") != "0"
+
 
 def _is_hopper(device):
     try:
@@ -82,7 +99,7 @@ def _im2col_gemm_rows(x, weight, bias, stride, h0, h1):
     return out.reshape(N, To, Ho, Wo, Cout).permute(0, 4, 1, 2, 3)
 
 
-def _conv3d_gemm(x, weight, bias, stride):
+def _conv3d_gemm(x, weight, bias, stride, contig_out=True):
     """Core (padding-free) 3D convolution as im2col + GEMM.
 
     `x` must already be padded by the caller (CausalConv3d applies the causal
@@ -114,7 +131,10 @@ def _conv3d_gemm(x, weight, bias, stride):
 
     if rows >= Ho:
         # single shot (Phase-1 path)
-        return _im2col_gemm_rows(x, weight, bias, stride, 0, Ho).contiguous()
+        out = _im2col_gemm_rows(x, weight, bias, stride, 0, Ho)
+        # 2A-5(b): channels-innermost view is fine for the projector's
+        # norm/act/rearrange chain; only materialize when asked to.
+        return out.contiguous() if contig_out else out
 
     out = torch.empty(N, Cout, To, Ho, Wo, device=x.device, dtype=x.dtype)
     for h0 in range(0, Ho, rows):
@@ -151,7 +171,71 @@ class CausalConv3d(nn.Conv3d):
                          self.padding[1], 2 * self.padding[0], 0)
         self.padding = (0, 0, 0)
 
+    def _forward_lean(self, x, cache_x):
+        """2A-5(a): single-materialization causal pad (+streaming cache).
+
+        Reference path: torch.cat([cache_x, x]) then F.pad(replicate) — the
+        full tensor is written twice. Here the padded input is assembled with
+        slice writes into a persistent buffer: interior <- x, cache frames,
+        replicate temporal front (only when no cache covers it), then the h/w
+        borders (edges first from the interior columns, then full-width rows,
+        which reproduces F.pad's corner semantics exactly). Values are
+        bit-identical; the buffer is consumed inside _conv3d_gemm (the im2col
+        gather copies out of it), so reuse across calls is safe.
+        """
+        wl, wr, ht, hb, t_front, _ = self._padding
+        N, C, T, H, W = x.shape
+        tc = 0
+        if cache_x is not None and t_front > 0:
+            cache_x = cache_x.to(x.device)
+            tc = cache_x.shape[2]
+        t_pad = max(t_front - tc, 0)   # replicate frames still needed in front
+        T_tot = t_pad + tc + T
+        shape = (N, C, T_tot, H + ht + hb, W + wl + wr)
+        buf = getattr(self, "_lean_pad_buf", None)
+        if buf is None or buf.shape != shape or buf.dtype != x.dtype \
+                or buf.device != x.device:
+            buf = torch.empty(shape, dtype=x.dtype, device=x.device)
+            self._lean_pad_buf = buf
+        hi = slice(ht, ht + H)
+        wi = slice(wl, wl + W)
+        buf[:, :, t_pad + tc:, hi, wi].copy_(x)
+        if tc:
+            buf[:, :, t_pad:t_pad + tc, hi, wi].copy_(cache_x)
+        if t_pad:
+            buf[:, :, :t_pad, hi, wi].copy_(
+                buf[:, :, t_pad:t_pad + 1, hi, wi].expand(N, C, t_pad, H, W))
+        if wl:
+            buf[:, :, :, hi, :wl].copy_(
+                buf[:, :, :, hi, wl:wl + 1].expand(N, C, T_tot, H, wl))
+        if wr:
+            buf[:, :, :, hi, W + wl:].copy_(
+                buf[:, :, :, hi, W + wl - 1:W + wl].expand(N, C, T_tot, H, wr))
+        if ht:
+            buf[:, :, :, :ht, :].copy_(
+                buf[:, :, :, ht:ht + 1, :].expand(N, C, T_tot, ht, W + wl + wr))
+        if hb:
+            buf[:, :, :, H + ht:, :].copy_(
+                buf[:, :, :, H + ht - 1:H + ht, :].expand(N, C, T_tot, hb, W + wl + wr))
+        # NOTE: contig_out must stay True. Feeding the channels-innermost view
+        # to RMS_norm changes F.normalize's reduction memory order and its
+        # accumulation order with it — measured max|diff|=0.40 / 49.9 dB vs
+        # the reference, which violates this optimization's lossless gate.
+        # (Layout-neutral in values, not in fp accumulation.)
+        return _conv3d_gemm(buf, self.weight, self.bias, self.stride,
+                            contig_out=True)
+
     def forward(self, x, cache_x=None):
+        # 2A-5: lean path (persistent pad buffer, no cat+pad double copy).
+        # Only where the GEMM backend would be used anyway; falls back to the
+        # reference path on any error.
+        if _LQPROJ_LEAN and _CONV3D_BACKEND == "gemm" and _is_hopper(x.device):
+            try:
+                return self._forward_lean(x, cache_x)
+            except Exception:
+                torch.cuda.empty_cache()
+                # fall through to the reference path
+
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -352,32 +436,37 @@ class Causal_LQ4x_Proj(nn.Module):
         self.clip_idx = 0
     
     def stream_forward(self, video_clip):
+        # 2A-5(c): the streaming-cache slices only need to snapshot values that
+        # are never mutated in place (pixel_shuffle/norm/act all produce fresh
+        # tensors), so a view is equivalent to the .clone() — the next call's
+        # pad assembly copies out of it at identical values.
+        _snap = (lambda t: t) if _LQPROJ_LEAN else (lambda t: t.clone())
         if self.clip_idx == 0:
             # self.clear_cache()
             with nvtx_range("lq_proj0"):
                 first_frame = video_clip[:, :, :1, :, :].repeat(1, 1, 3, 1, 1)
                 video_clip = torch.cat([first_frame, video_clip], dim=2)
                 x = self.pixel_shuffle(video_clip)
-                cache1_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache1_x = _snap(x[:, :, -CACHE_T:, :, :])
                 with nvtx_range("lq_conv1"):
                     x = self.conv1(x, self.cache['conv1'])
                 self.cache['conv1'] = cache1_x
                 x = self.norm1(x)
                 x = self.act1(x)
-                cache2_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache2_x = _snap(x[:, :, -CACHE_T:, :, :])
                 self.cache['conv2'] = cache2_x
                 self.clip_idx += 1
                 return None
         else:
             with nvtx_range("lq_proj"):
                 x = self.pixel_shuffle(video_clip)
-                cache1_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache1_x = _snap(x[:, :, -CACHE_T:, :, :])
                 with nvtx_range("lq_conv1"):
                     x = self.conv1(x, self.cache['conv1'])
                 self.cache['conv1'] = cache1_x
                 x = self.norm1(x)
                 x = self.act1(x)
-                cache2_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache2_x = _snap(x[:, :, -CACHE_T:, :, :])
                 with nvtx_range("lq_conv2"):
                     x = self.conv2(x, self.cache['conv2'])
                 self.cache['conv2'] = cache2_x
