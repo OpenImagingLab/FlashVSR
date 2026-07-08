@@ -549,12 +549,23 @@ stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
   per-iteration layout conversions), i.e. 12-warp warp-specialization with
   softmax/WGMMA pingpong is the empirically optimal structure here, and the
   gate's intent (kill the no-eligible-warp starvation) is what the passing
-  metrics measure. E2E banks −15.9 of the −22.1 ms/chunk the kernel saves
-  (30 × 737 µs): the remainder is the H8 power-cap clawback — the v2 kernel
-  raises sustained tensor throughput, so DVFS sags clocks harder during the
-  attention window; efficiency survives, raw time partially rebounds.
-  @768 lands at 45.5 FPS (+9.1%) instead of the roadmap's 49–51 estimate for
-  the same reason. Follow-ups: (1) re-measure `FLASHVSR_DECODER_OVERLAP`
+  metrics measure. E2E banks −15.9 ms/chunk vs the −22.1 ms one would get by
+  naively scaling the single-shape ncu delta (737 µs × 30): that −22.1 was an
+  extrapolation, not a target — the 30 attention calls/chunk span DiT blocks
+  at different densities and warm-cache states, so the measured −15.9 ms is
+  the truth and the gap is extrapolation slack, NOT power throttling.
+  Power/clock was directly measured (nvidia-smi dmon, OFF vs ON busy window):
+  the GPU is a 900 W-capable Hopper enforced to 700 W (the 1000 W Grace+Hopper
+  module budget minus ~300 W reserved for Grace/LPDDR5X), but BOTH backends
+  peak at only ~660 W (v1 666 W / v2 660 W) — never touching the 700 W cap —
+  and BOTH sag identically to ~1650–1800 MHz under the 1980 MHz lock (a
+  heavy-tensor DVFS operating point, not a power or thermal cap: temps 52–56
+  °C, power under limit). Since the sag is backend-independent it cannot be
+  the OFF-vs-ON differential; v2 does the SAME work at the SAME ~660 W in less
+  time = pure efficiency. (An earlier draft of this entry wrongly attributed
+  the gap to an H8 power-cap clawback; corrected here against the dmon data.)
+  @768 lands at 45.5 FPS (+9.1%); the roadmap's 49–51 was itself built on the
+  same optimistic 0.9 ms/call extrapolation. Follow-ups: (1) re-measure `FLASHVSR_DECODER_OVERLAP`
   co-execution on top of triton2 (v2 still occupies 229 KB smem/SM, so the
   34% co-execution ceiling probably persists — measure, don't assume);
   (2) long_sb 2.00/wait 1.32 in v2 are now the top stalls (TMA-latency
