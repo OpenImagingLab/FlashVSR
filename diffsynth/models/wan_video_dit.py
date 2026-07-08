@@ -119,6 +119,25 @@ try:
 except Exception:
     _TRITON_BSA = None
 
+# ---------------------------------------------------------------------------
+# Phase 2A-3: strided attention IO (FLASHVSR_ATTN_STRIDED_IO, default OFF).
+#
+# The triton-backend glue below performs three (S,n,d)->(n,S,d) .contiguous()
+# transposes for q/k/v plus a transpose of the output — ~11.6 ms/chunk of
+# SM-bound strided copies (ANALYSIS §1.2/§2.3). The strided-IO variant keeps
+# tensors in the glue's natural token-major (S, n, d) layout end to end:
+# TMA descriptors address per-head tiles inside the 2D (S, n*d) view, and the
+# kernel stores the output directly in (S, n, d). Same tile schedule and
+# accumulation order -> gated on max|diff| kernel-level + E2E PSNR >= 49 dB.
+# On any failure the glue falls back to the contiguous triton path (NOT to
+# the sparse backend), preserving the existing fallback ladder.
+# ---------------------------------------------------------------------------
+_ATTN_STRIDED_IO = os.environ.get("FLASHVSR_ATTN_STRIDED_IO", "0") != "0"
+try:
+    from .triton_block_sparse_attn import triton_block_sparse_attention_snd as _TRITON_BSA_SND
+except Exception:
+    _TRITON_BSA_SND = None
+
 
 def _is_hopper_dev(device):
     try:
@@ -416,11 +435,20 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         # Triton WGMMA block-sparse backend (opt-in, Hopper-guarded, exact mask).
         if _ATTN_BACKEND == "triton" and _is_hopper_dev(q.device) and _TRITON_BSA is not None:
             try:
-                # block mask -> (H, Nqb, Nkvb) bool ; q/k/v (S,n,d) -> (n,S,d)
+                # block mask -> (H, Nqb, Nkvb) bool
                 bm = base_blockmask
                 if bm.dim() == 4:
                     bm = bm[0]
                 bm = bm.bool()
+                # 2A-3: strided IO — q/k/v stay (S, n, d), output comes back
+                # (S, n, d); zero transpose/contiguous copies in the glue.
+                if _ATTN_STRIDED_IO and _TRITON_BSA_SND is not None:
+                    try:
+                        xh = _TRITON_BSA_SND(q, k, v, bm)   # (S, n, d)
+                        return xh.reshape(1, xh.shape[0], -1)
+                    except Exception:
+                        torch.cuda.empty_cache()  # fall back to contiguous triton
+                # contiguous path: q/k/v (S,n,d) -> (n,S,d)
                 qh = q.transpose(0, 1).contiguous()
                 kh = k.transpose(0, 1).contiguous()
                 vh = v.transpose(0, 1).contiguous()

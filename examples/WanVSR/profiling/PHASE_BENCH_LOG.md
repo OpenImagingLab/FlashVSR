@@ -52,6 +52,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-1a | RoPE freqs device cache | `FLASHVSR_CACHE_ROPE_FREQS` | 38.585 | 38.592 | +0.02% | 156.28 ms | 156.30 ms | 12.60 GiB | 12.63 GiB | max\|diff\|=0 (bit-identical) | keep-behind-flag |
 | 2026-07-08 | 2A-1b | Fused RoPE apply | `FLASHVSR_FUSE_ROPE` | 38.585 | 39.023 | +1.14% | 156.28 ms | 153.62 ms | 12.60 GiB | 12.60 GiB | max\|diff\|=0 (bit-identical) | keep-enabled |
 | 2026-07-08 | 2A-2 | KV cache arena (no per-chunk cat) | `FLASHVSR_KV_RINGBUF` | 39.023 | 39.429 | +1.04% | 153.62 ms | 150.76 ms | 12.60 GiB | 15.50 GiB | max\|diff\|=0 over 9 chunks | keep-enabled |
+| 2026-07-08 | 2A-3 | Attention strided IO (no transposes) | `FLASHVSR_ATTN_STRIDED_IO` | 39.429 | 41.099 | +4.24% | 150.76 ms | 141.14 ms | 15.50 GiB | 15.50 GiB | kernel + E2E max\|diff\|=0 | keep-enabled |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -125,6 +126,39 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   retained memory (documented; `FLASHVSR_KV_RINGBUF_SPARE` trades memory for
   compaction frequency, and the flag restores the old path entirely).
 
+#### 2026-07-08 10:20 · Phase 2A-3 · Attention-path strided IO
+
+- Commit / patch: phase2a attention strided IO
+- Files changed: `diffsynth/models/triton_block_sparse_attn.py`
+  (`_bsfa_tma_kernel_snd`, `triton_block_sparse_attention_snd`),
+  `diffsynth/models/wan_video_dit.py` (glue branch in `flash_attention`)
+- Flag: `FLASHVSR_ATTN_STRIDED_IO` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1`) + flag under test
+- Exact benchmark command: §0.4 primary + `FLASHVSR_FUSE_ROPE=1 FLASHVSR_KV_RINGBUF=1 FLASHVSR_ATTN_STRIDED_IO=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 39.429 → 41.099 (+4.24%) — 3-run medians
+- Steady chunk before → after (Δ): 150.76 → 141.14 ms (−9.62 ms)
+- Peak mem before → after: 15.50 → 15.50 GiB
+- Correctness: kernel-level max|diff| == 0 vs contiguous path on the real
+  shape (both TMA and non-TMA variants); E2E
+  `test_phase2a_lossless.py ATTN_STRIDED_IO` → max|diff| == 0 (exceeds the
+  ≥49 dB gate)
+- Isolated: contiguous glue+kernel 2.851 ms/call → strided 2.514 ms/call;
+  strided is even faster than the kernel alone on pre-copied inputs
+  (2.558 ms) — per-head tiles are adjacent in the (S, n*d) layout, so TMA
+  loads of neighbouring heads share L2 lines
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: −9.6 of the −11.6 ms ceiling: all four transpose copies are
+  gone; the residual is the win_part/win_rev reorder that was counted in the
+  same bucket. Bit-identical because the tile schedule and accumulation order
+  are unchanged — only addressing moved from flattened (H·S, D) descriptors
+  to 2D (S, H·D) descriptors with per-head column offsets. TMA=0 fallback is
+  also strided (stride-general kernel), and any failure falls back to the
+  contiguous triton path, not to the sparse backend.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -160,6 +194,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | 38.585 | 156.28 ms | 12.6 GiB | — | Step-0 fresh baseline (2026-07-08, df94d94) |
 | 1 | baseline + FUSE_ROPE | 39.023 | 153.62 ms | 12.6 GiB | +1.14% FPS / −2.66 ms | 2A-1b, lossless |
 | 2 | + KV_RINGBUF | 39.429 | 150.76 ms | 15.5 GiB | +2.19% FPS / −5.52 ms | 2A-2, lossless; +2.9 GiB arena slack |
+| 3 | + ATTN_STRIDED_IO | 41.099 | 141.14 ms | 15.5 GiB | +6.52% FPS / −15.14 ms | 2A-3, lossless |
 
 ---
 

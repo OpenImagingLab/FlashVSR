@@ -94,6 +94,56 @@ if _TRITON_OK:
 
 if _TMA_OK:
 
+    # -----------------------------------------------------------------------
+    # Phase 2A-3 strided-IO TMA kernel (FLASHVSR_ATTN_STRIDED_IO).
+    #
+    # Identical math/masking to _bsfa_tma_kernel below; only the addressing
+    # differs. Q/K/V stay in the glue's natural token-major layout
+    # (S, H, D) == a contiguous 2D matrix (S, H*D): the descriptor covers that
+    # 2D view and each (head, block) tile is loaded at [row0, head*HEAD_DIM]
+    # instead of flattening to (H*S, D) — which is what forced the three
+    # (S,n,d)->(n,S,d) .contiguous() copies (11.6 ms/chunk, ANALYSIS §1.2/2.3).
+    # The output is written with explicit strides straight into an (S, H, D)
+    # tensor, killing the output transpose too.
+    # -----------------------------------------------------------------------
+    @triton.jit
+    def _bsfa_tma_kernel_snd(
+        q_desc, k_desc, v_desc, O, KVIdx, KVCnt, sm_scale,
+        soh, som, sok, sih, sim, sic, sch, scm, H, N_Q, N_KV,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    ):
+        start_m = tl.program_id(0)
+        off_h = tl.program_id(1)
+        col0 = off_h * HEAD_DIM
+        q = q_desc.load([start_m * BLOCK_M, col0])   # TMA tile @ (row, head-col)
+        qs = (q * sm_scale).to(q.dtype)
+        m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+        offs_n = tl.arange(0, BLOCK_N)
+        cnt = tl.load(KVCnt + off_h * sch + start_m * scm)
+        base = KVIdx + off_h * sih + start_m * sim
+        for j in range(0, cnt):
+            kvb = tl.load(base + j * sic)
+            kk = k_desc.load([kvb * BLOCK_N, col0])
+            qk = tl.dot(qs, kk.T)
+            n = kvb * BLOCK_N + offs_n
+            qk = tl.where(n[None, :] < N_KV, qk, -float("inf"))
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            p = tl.math.exp2((qk - m_ij[:, None]) * 1.44269504)
+            alpha = tl.math.exp2((m_i - m_ij) * 1.44269504)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            vv = v_desc.load([kvb * BLOCK_N, col0])
+            acc += tl.dot(p.to(vv.dtype), vv)
+            m_i = m_ij
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+        acc = acc / l_safe[:, None]
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, HEAD_DIM)
+        tl.store(O + off_h * soh + offs_m[:, None] * som + offs_k[None, :] * sok,
+                 acc.to(O.dtype.element_ty), mask=offs_m[:, None] < N_Q)
+
     @triton.jit
     def _bsfa_tma_kernel(
         q_desc, k_desc, v_desc, O, KVIdx, KVCnt, sm_scale,
@@ -162,6 +212,71 @@ def _bsfa_tma(q, k, v, bm, sm_scale, BLOCK_M, BLOCK_N, num_warps, num_stages):
         idx.stride(0), idx.stride(1), idx.stride(2),
         cnt.stride(0), cnt.stride(1),
         H, Nq, Nkv, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return o
+
+
+def triton_block_sparse_attention_snd(q, k, v, block_mask, sm_scale=None,
+                                      BLOCK_M=128, BLOCK_N=128, num_warps=8,
+                                      num_stages=2):
+    """Strided-IO WGMMA block-sparse attention (Phase 2A-3).
+
+    q: (Nq, H, D), k/v: (Nkv, H, D) — the glue's natural token-major layout,
+    contiguous, WITHOUT per-head transpose copies. block_mask: (H, Nqb, Nkvb)
+    bool (True = compute). Returns (Nq, H, D) contiguous.
+
+    Math (tile schedule, masking, accumulation order) is identical to
+    triton_block_sparse_attention; only tile addressing differs, so outputs
+    are expected bit-identical for the same inputs.
+    """
+    assert _TRITON_OK, "triton not available"
+    Nq, H, D = q.shape
+    Nkv = k.shape[0]
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+    Nqb = triton.cdiv(Nq, BLOCK_M)
+    Nkvb = triton.cdiv(Nkv, BLOCK_N)
+    bm = block_mask[..., :Nqb, :Nkvb]
+    idx, cnt = _make_csr(bm)
+    o = torch.empty_like(q)                     # (Nq, H, D) — final layout
+    grid = (Nqb, H)
+
+    if _USE_TMA and _TMA_OK and q.is_contiguous() and k.is_contiguous() \
+            and v.is_contiguous():
+        try:
+            # 2D (S, H*D) views are free on the contiguous (S, H, D) tensors.
+            q2 = q.view(Nq, H * D)
+            k2 = k.view(Nkv, H * D)
+            v2 = v.view(Nkv, H * D)
+            q_desc = _TensorDescriptor.from_tensor(q2, [BLOCK_M, D])
+            k_desc = _TensorDescriptor.from_tensor(k2, [BLOCK_N, D])
+            v_desc = _TensorDescriptor.from_tensor(v2, [BLOCK_N, D])
+            _bsfa_tma_kernel_snd[grid](
+                q_desc, k_desc, v_desc, o, idx, cnt, sm_scale,
+                o.stride(1), o.stride(0), o.stride(2),
+                idx.stride(0), idx.stride(1), idx.stride(2),
+                cnt.stride(0), cnt.stride(1),
+                H, Nq, Nkv, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
+                num_warps=num_warps, num_stages=max(num_stages, 3),
+            )
+            return o
+        except Exception:
+            torch.cuda.empty_cache()  # fall through to the stride-general kernel
+
+    # Non-TMA path: _bsfa_kernel is fully stride-parameterized, so transposed
+    # *views* (no copies) express the (H, N, D) indexing over (N, H, D) data.
+    qt, kt, vt, ot = (t.transpose(0, 1) for t in (q, k, v, o))
+    _bsfa_kernel[grid](
+        qt, kt, vt, ot, idx, cnt, sm_scale,
+        qt.stride(0), qt.stride(1), qt.stride(2),
+        kt.stride(0), kt.stride(1), kt.stride(2),
+        vt.stride(0), vt.stride(1), vt.stride(2),
+        ot.stride(0), ot.stride(1), ot.stride(2),
+        idx.stride(0), idx.stride(1), idx.stride(2),
+        cnt.stride(0), cnt.stride(1),
+        H, Nq, Nkv,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
         num_warps=num_warps, num_stages=num_stages,
     )
     return o
