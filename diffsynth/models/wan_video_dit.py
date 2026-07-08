@@ -215,6 +215,87 @@ class WindowPartition3D:
         return x.view(B, F, H, W, -1)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A-2: KV cache arena (FLASHVSR_KV_RINGBUF, default OFF).
+#
+# The streaming self-attention KV cache is maintained today as
+#   k_w = torch.cat([pre_cache_k, k_w_new], dim=0)   # copies the WHOLE window
+#   cache_k = k_w[one_len:]                          # trim = slice view
+# i.e. every chunk copies pre+new (~264 window-blocks @768) per tensor per
+# block at HBM bandwidth (kv_cat = 3.4 ms/chunk, ANALYSIS §1.2) even though
+# only `one_len` (~66) windows are new.
+#
+# The arena replaces this with a preallocated per-block buffer of
+# (kv_len + 1 + SPARE) temporal slots × one_len windows:
+#   - new windows are partition-written directly into the tail (this replaces
+#     the .contiguous() materialization inside WindowPartition3D.partition, so
+#     it adds no traffic),
+#   - the live KV window is the contiguous slice buf[start : start+length] —
+#     same values, same temporal order, same contiguity as the cat result,
+#   - trimming the oldest slot advances `start` (no copy),
+#   - when the tail reaches capacity the live window is compacted to offset 0
+#     (amortized once every SPARE chunks; overlap-safe).
+# Net: ~264 → ~66+198/(SPARE+1) window-copies per chunk per tensor, at the
+# cost of SPARE extra slots of retained memory per tensor.
+#
+# Values and ordering are bit-identical to the cat path (copies only, no
+# arithmetic), so this is gated by max|diff|==0 across a full multi-chunk
+# clip (exercises rotation + compaction). Works with every attention backend
+# (the consumed view is contiguous, exactly like the cat result).
+# ---------------------------------------------------------------------------
+_KV_RINGBUF = os.environ.get("FLASHVSR_KV_RINGBUF", "0") != "0"
+_KV_RINGBUF_SPARE = max(1, int(os.environ.get("FLASHVSR_KV_RINGBUF_SPARE", "2")))
+
+
+class _KVArena:
+    """Sliding-window KV arena; flows through the pre_cache_k/v slots."""
+    __slots__ = ("buf", "start", "length", "one_len")
+
+    def __init__(self, kv_len, one_len, block_s, dim, dtype, device):
+        cap = (kv_len + 1 + _KV_RINGBUF_SPARE) * one_len
+        self.buf = torch.empty(cap, block_s, dim, dtype=dtype, device=device)
+        self.start = 0
+        self.length = 0
+        self.one_len = one_len
+
+    def append_partition(self, x, win):
+        """Window-partition `x` (B=1, f, h, w, C) directly into the arena tail
+        and return the live contiguous view buf[start : start+length].
+
+        The write performs exactly the permute-copy that
+        WindowPartition3D.partition's .contiguous() would perform, with the
+        arena slice as destination -> bit-identical values/order."""
+        B, F_, H_, W_, C = x.shape
+        wf, wh, ww = win
+        n_new = (F_ // wf) * (H_ // wh) * (W_ // ww)
+        cap = self.buf.shape[0]
+        if self.start + self.length + n_new > cap:
+            # Compact the live window to offset 0 (kv_cat residual, amortized).
+            with nvtx_range("kv_cat"):
+                if self.start < self.length:
+                    # overlapping ranges: stage through a temp (copy_ on
+                    # overlapping storage is undefined). Only possible with
+                    # very tight SPARE settings.
+                    tmp = self.buf[self.start:self.start + self.length].clone()
+                    self.buf[:self.length].copy_(tmp)
+                else:
+                    self.buf[:self.length].copy_(
+                        self.buf[self.start:self.start + self.length])
+                self.start = 0
+        dst = self.buf[self.start + self.length:
+                       self.start + self.length + n_new]
+        src = x.view(B, F_ // wf, wf, H_ // wh, wh, W_ // ww, ww, C) \
+               .permute(0, 1, 3, 5, 2, 4, 6, 7)
+        dst.view(B, F_ // wf, H_ // wh, W_ // ww, wf, wh, ww, C).copy_(src)
+        self.length += n_new
+        return self.buf[self.start:self.start + self.length]
+
+    def trim(self, n_windows):
+        """Drop the oldest n_windows (pointer advance, no data movement)."""
+        self.start += n_windows
+        self.length -= n_windows
+
+
 # B2: process-wide cache for the geometry-only additive attention bias.
 _MASK_BIAS_CACHE = {}
 
@@ -565,22 +646,41 @@ class SelfAttention(nn.Module):
             q = rope_apply(q, freqs, self.num_heads)
             k = rope_apply(k, freqs, self.num_heads)
 
-        with nvtx_range("win_part"):
-            win = (2, 8, 8)
-            q = q.view(B, f, h, w, D)
-            k = k.view(B, f, h, w, D)
-            v = v.view(B, f, h, w, D)
-
-            q_w = WindowPartition3D.partition(q, win)
-            k_w = WindowPartition3D.partition(k, win)
-            v_w = WindowPartition3D.partition(v, win)
-
+        win = (2, 8, 8)
         seqlen = f//win[0]
-        one_len = k_w.shape[0] // B // seqlen
-        if pre_cache_k is not None and pre_cache_v is not None:
-            with nvtx_range("kv_cat"):
-                k_w = torch.cat([pre_cache_k, k_w], dim=0)
-                v_w = torch.cat([pre_cache_v, v_w], dim=0)
+        use_arena = _KV_RINGBUF and is_stream and B == 1
+        if use_arena:
+            # 2A-2 arena path: partition K/V straight into the preallocated
+            # cache; k_w/v_w are the live contiguous views (pre + new, in
+            # temporal order) — bit-identical to the cat path below.
+            with nvtx_range("win_part"):
+                q = q.view(B, f, h, w, D)
+                k = k.view(B, f, h, w, D)
+                v = v.view(B, f, h, w, D)
+                q_w = WindowPartition3D.partition(q, win)
+                one_len = (h // win[1]) * (w // win[2])
+                block_tokens = win[0] * win[1] * win[2]  # tokens per window (=128)
+                arena_k = pre_cache_k if isinstance(pre_cache_k, _KVArena) else \
+                    _KVArena(kv_len, one_len, block_tokens, D, x.dtype, x.device)
+                arena_v = pre_cache_v if isinstance(pre_cache_v, _KVArena) else \
+                    _KVArena(kv_len, one_len, block_tokens, D, x.dtype, x.device)
+                k_w = arena_k.append_partition(k, win)
+                v_w = arena_v.append_partition(v, win)
+        else:
+            with nvtx_range("win_part"):
+                q = q.view(B, f, h, w, D)
+                k = k.view(B, f, h, w, D)
+                v = v.view(B, f, h, w, D)
+
+                q_w = WindowPartition3D.partition(q, win)
+                k_w = WindowPartition3D.partition(k, win)
+                v_w = WindowPartition3D.partition(v, win)
+
+            one_len = k_w.shape[0] // B // seqlen
+            if pre_cache_k is not None and pre_cache_v is not None:
+                with nvtx_range("kv_cat"):
+                    k_w = torch.cat([pre_cache_k, k_w], dim=0)
+                    v_w = torch.cat([pre_cache_v, v_w], dim=0)
 
         block_n = q_w.shape[0] // B
         block_s = q_w.shape[1]
@@ -605,14 +705,23 @@ class SelfAttention(nn.Module):
             x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
         with nvtx_range("cache_trim"):
-            cur_block_n, cur_block_s, _ = k_w.shape
-            cache_num = cur_block_n // one_len
-            if cache_num > kv_len:
-                cache_k = k_w[one_len:, :, :]
-                cache_v = v_w[one_len:, :, :]
+            if use_arena:
+                # same semantics as the slice-trim below: drop the oldest
+                # temporal slot once more than kv_len slots are cached.
+                if arena_k.length // one_len > kv_len:
+                    arena_k.trim(one_len)
+                    arena_v.trim(one_len)
+                cache_k = arena_k
+                cache_v = arena_v
             else:
-                cache_k = k_w
-                cache_v = v_w
+                cur_block_n, cur_block_s, _ = k_w.shape
+                cache_num = cur_block_n // one_len
+                if cache_num > kv_len:
+                    cache_k = k_w[one_len:, :, :]
+                    cache_v = v_w[one_len:, :, :]
+                else:
+                    cache_k = k_w
+                    cache_v = v_w
 
         with nvtx_range("win_rev"):
             x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)

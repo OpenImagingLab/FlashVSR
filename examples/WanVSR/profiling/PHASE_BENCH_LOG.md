@@ -51,6 +51,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 |------|-------|--------------|------|------------|-----------|-------|---------------------|--------------------|-----------------|----------------|-------------|----------|
 | 2026-07-08 | 2A-1a | RoPE freqs device cache | `FLASHVSR_CACHE_ROPE_FREQS` | 38.585 | 38.592 | +0.02% | 156.28 ms | 156.30 ms | 12.60 GiB | 12.63 GiB | max\|diff\|=0 (bit-identical) | keep-behind-flag |
 | 2026-07-08 | 2A-1b | Fused RoPE apply | `FLASHVSR_FUSE_ROPE` | 38.585 | 39.023 | +1.14% | 156.28 ms | 153.62 ms | 12.60 GiB | 12.60 GiB | max\|diff\|=0 (bit-identical) | keep-enabled |
+| 2026-07-08 | 2A-2 | KV cache arena (no per-chunk cat) | `FLASHVSR_KV_RINGBUF` | 39.023 | 39.429 | +1.04% | 153.62 ms | 150.76 ms | 12.60 GiB | 15.50 GiB | max\|diff\|=0 over 9 chunks | keep-enabled |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -100,6 +101,30 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   Remaining rope headroom (folding the apply into the attention prologue or
   fp32 freqs) is Phase-4 territory (numerics change).
 
+#### 2026-07-08 09:55 · Phase 2A-2 · KV cache arena (kv_cat removal)
+
+- Commit / patch: phase2a kv cache arena
+- Files changed: `diffsynth/models/wan_video_dit.py` (`_KVArena`, `SelfAttention.forward`)
+- Flag: `FLASHVSR_KV_RINGBUF` (default OFF); tuning: `FLASHVSR_KV_RINGBUF_SPARE` (default 2)
+- Env vars used (full set): full-knob baseline + `FLASHVSR_FUSE_ROPE=1` (kept set) + flag under test
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_FUSE_ROPE=1 FLASHVSR_KV_RINGBUF=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 39.023 → 39.429 (+1.04%) — 3-run medians
+- Steady chunk before → after (Δ): 153.62 → 150.76 ms (−2.86 ms)
+- Peak mem before → after: 12.60 → 15.50 GiB (+2.9 GiB = 2 spare arena slots × 60 tensors)
+- Correctness: `test_phase2a_lossless.py KV_RINGBUF` → max|diff| == 0 over a
+  9-chunk clip (exercises slot rotation AND tail compaction)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: recovers essentially the whole kv_cat budget (−2.9 of the
+  3.4 ms attribution): new windows are partition-written straight into the
+  arena (no extra traffic) and only the amortized compaction remains — visible
+  as ~+2.5 ms on every 3rd chunk in the per-chunk trace. Bit-identical since
+  the live view preserves value order and contiguity exactly. Cost is +2.9 GiB
+  retained memory (documented; `FLASHVSR_KV_RINGBUF_SPARE` trades memory for
+  compaction frequency, and the flag restores the old path entirely).
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -134,6 +159,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 |------|----------------------|-----|-------------------|-------------|---------------------------|-------|
 | 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | 38.585 | 156.28 ms | 12.6 GiB | — | Step-0 fresh baseline (2026-07-08, df94d94) |
 | 1 | baseline + FUSE_ROPE | 39.023 | 153.62 ms | 12.6 GiB | +1.14% FPS / −2.66 ms | 2A-1b, lossless |
+| 2 | + KV_RINGBUF | 39.429 | 150.76 ms | 15.5 GiB | +2.19% FPS / −5.52 ms | 2A-2, lossless; +2.9 GiB arena slack |
 
 ---
 
