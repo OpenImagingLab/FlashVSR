@@ -9,6 +9,8 @@ from typing import Tuple, Optional, List
 from einops import rearrange
 from .utils import hash_state_dict_keys
 from ..nvtx_utils import nvtx_range
+# Phase 2B-2: FP8 GEMM infrastructure (FLASHVSR_FP8_GEMM, default OFF).
+from . import fp8_gemm as _fp8g
 
 try:
     import flash_attn_interface
@@ -709,9 +711,17 @@ class SelfAttention(nn.Module):
         assert L == f * h * w, "Sequence length mismatch with provided (f,h,w)."
 
         with nvtx_range("qkv_norm"):
-            q = self.norm_q(self.q(x))
-            k = self.norm_k(self.k(x))
-            v = self.v(x)
+            if _fp8g.enabled("qkv"):
+                # 2B-2: q/k/v consume the same activation -> quantize x once
+                # (per-row scales) and run three e4m3 scaled_mm GEMMs.
+                pre = _fp8g.quant(x.reshape(-1, x.shape[-1]))
+                q = self.norm_q(_fp8g.linear(self.q, x, pre=pre))
+                k = self.norm_k(_fp8g.linear(self.k, x, pre=pre))
+                v = _fp8g.linear(self.v, x, pre=pre)
+            else:
+                q = self.norm_q(self.q(x))
+                k = self.norm_k(self.k(x))
+                v = self.v(x)
         with nvtx_range("rope"):
             q = rope_apply(q, freqs, self.num_heads)
             k = rope_apply(k, freqs, self.num_heads)
@@ -799,7 +809,8 @@ class SelfAttention(nn.Module):
             x = x.view(B, f*h*w, D)
 
         with nvtx_range("o_proj"):
-            out = self.o(x)
+            # 2B-2: e4m3 o-projection (per-row activation scales).
+            out = _fp8g.linear(self.o, x) if _fp8g.enabled("o") else self.o(x)
         if is_stream:
             return out, cache_k, cache_v
         return out
@@ -918,7 +929,15 @@ class DiTBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
         with nvtx_range("ffn"):
             input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-            x = self.gate(x, gate_mlp, self.ffn(input_x))
+            if _fp8g.enabled("ffn"):
+                # 2B-2: e4m3 ffn1+ffn2; GELU is fused into ffn2's input
+                # quantization kernel (fp32 gelu -> e4m3).
+                x = self.gate(x, gate_mlp, _fp8g.ffn(self.ffn, input_x))
+            elif _fp8g.enabled("ffn1"):
+                # 2B-2 bisection scope: e4m3 ffn1 only (ffn2 stays bf16).
+                x = self.gate(x, gate_mlp, _fp8g.ffn_partial(self.ffn, input_x))
+            else:
+                x = self.gate(x, gate_mlp, self.ffn(input_x))
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

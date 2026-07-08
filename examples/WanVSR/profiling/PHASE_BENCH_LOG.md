@@ -57,6 +57,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-5 | LQ projector lean (pad fold + no clones) | `FLASHVSR_LQPROJ_LEAN` | 41.477 | 41.580 | +0.25% | 139.00 ms | 138.46 ms | 15.50 GiB | 15.62 GiB | E2E max\|diff\|=0 (after dropping sub-item b) | keep-enabled |
 | 2026-07-08 | 2A-6 | CUDA Graphs on steady chunk | (not implemented) | 41.580 | — | — | 138.46 ms | — | 15.62 GiB | — | n/a | postpone (go/no-go gate failed) |
 | 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.662 | 42.373 | +1.71% | 138.30 ms | 190.58 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | E2E max\|diff\|=0 (full+short clip, 3x repeats) | keep-behind-flag |
+| 2026-07-08 | 2B-2 | FP8 GEMM infra (e4m3 `_scaled_mm` + Triton rowwise quant) | `FLASHVSR_FP8_GEMM` | 41.704 | 42.986 | +3.07% | 137.98 ms | 132.96 ms | 15.62 GiB | 16.65 GiB | PSNR 40.70 dB (full scope; NOT lossless by design — Phase-4 gate) | keep-behind-flag (Phase-4 enable gate) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -338,6 +339,65 @@ FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
 | 768 · 2A stack, overlap ON | 42.373 | 190.58 ms | 125.1 ms | 15.16 GiB | decode rides inside chunks; tail = last-chunk decode remainder + color fix |
 | 1536 · 2A stack, overlap OFF | 11.485 | 502.46 ms | 2046.2 ms | 48.39 GiB | matches 2A closure spot-check (11.489) |
 | 1536 · 2A stack, overlap ON | 11.712 | 682.66 ms | 470.3 ms | 46.72 GiB | +2.0% FPS; decode share is larger at high res but co-execution stays SM-bound |
+
+#### 2026-07-08 13:55 · Phase 2B-2 · FP8 GEMM infrastructure (`torch._scaled_mm`)
+
+- Commit / patch: phase2b fp8 gemm infrastructure (on top of 41f1d8e)
+- Files changed: new `diffsynth/models/fp8_gemm.py` (flag, Triton rowwise
+  quantizer, gelu-fused quantizer, weight pre-cast cache, `_scaled_mm`
+  wrappers with sticky eager fallback), `diffsynth/models/wan_video_dit.py`
+  (qkv shared-quant site, o site, ffn site), `examples/WanVSR/utils/utils.py`
+  (LQ per-layer linears, one shared quant for 30 GEMMs), new
+  `examples/WanVSR/test_fp8_gemm_quality.py`, new
+  `examples/WanVSR/profiling/sweep_fp8_scope.py` (per-site attribution tool
+  for the Phase-4 audit)
+- Flag: `FLASHVSR_FP8_GEMM` (default OFF — **permanently until the Phase-4
+  quality protocol clears it**); scope bisection via
+  `FLASHVSR_FP8_GEMM_SCOPE=qkv,o,ffn,lq` (+`ffn1` token, not in default set)
+- Design: weights pre-cast once to e4m3 with per-out-channel scales (lazy,
+  cached on module, +1.03 GiB); activations quantized per call with per-row
+  scales by ONE Triton kernel (row amax + cast in a single launch — the
+  eager/compiled quantize chain measured ~5x off bandwidth, 113-272 µs, and
+  erased the GEMM win; the kernel does 15.1 µs @ 8448x1536); ffn2's input
+  quant is fused with GELU-tanh (fp32 gelu -> e4m3, replacing the eager bf16
+  GELU pass — on the 8960-wide activation this flips ffn2 from net-loss to
+  net-win); bias fused in `_scaled_mm` epilogue; `use_fast_accum=False`
+- Env vars used (full set): full-knob baseline + 2A kept set + flag under test
+- Exact benchmark command: §0.4 primary + 2A kept set + `FLASHVSR_FP8_GEMM=1`
+- Resolution / frames: 768x1408 / F=81 (1536 spot-check: deferred to phase
+  closure; flag is default-OFF anyway)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.704 → 42.986 (+3.07%) — 3-run medians
+- Steady chunk before → after (Δ): 137.98 → 132.96 ms (−5.02 ms)
+- Peak mem before → after: 15.62 → 16.65 GiB (+1.03 GiB e4m3 weight copies)
+- Correctness / quality (Phase-4 protocol measurement, example0 @768):
+  full scope PSNR **40.70 dB** (max|d|=0.875, mean|d|=0.0114) →
+  revert-or-redesign tier for *enablement*. Per-site sweep
+  (`sweep_fp8_scope.py`): qkv 45.58 dB (and net-SLOWER in-pipe) · o 45.05 ·
+  ffn 42.37 (the speed lever AND the quality offender) · ffn1-only 44.15 ·
+  lq 49.08 (recommended tier, speed-neutral) · qkv,o,lq 43.42 ·
+  o,ffn,lq 41.34 — every meaningful-speed combination lands < 45 dB.
+  Flag-OFF neutrality: `test_phase2a_lossless.py ALL` max|diff|=0 PASS,
+  `test_decoder_overlap_lossless.py` PASS (default paths untouched).
+- Kernel evidence: torch.profiler + ncu on the live pipeline steady chunk
+  (`profiling/reports/ncu/phase2b2_fp8_kernels.ncu-rep`): e4m3 GEMMs dispatch
+  `nvjet_sm90_qqtst_128x128_128x6_..._ovscale_bias_TNT` (6/10 sampled nvjet
+  launches) vs bf16 `nvjet_sm90_tst_256x128_...` — FP8 kernels confirmed
+  selected. Isolated GEMM ratios (locked 1980 MHz, pre-quantized inputs):
+  qkv ×1.45-1.53, ffn1 ×1.26-1.38, ffn2 ×1.54, lq ×1.43.
+- Decision: keep-behind-flag (mandatory per roadmap — 2B-2 ships default-OFF
+  regardless of speed; enable decision belongs to Phase 4)
+- Interpretation: the infrastructure works and is net-faster (+3.07% E2E,
+  −5.0 ms/chunk — inside the revised −3.5..−6 ms estimate once dynamic
+  quantization costs are counted; the roadmap's −13 ms ceiling assumed
+  pre-quantized activations). But the distilled one-step model is confirmed
+  fp8-sensitive: 40.7 dB full-scope with errors compounding across the 30
+  blocks and persisting through the KV cache, so **no fp8 configuration is
+  currently enable-eligible**. Phase-4 redesign ticket (in priority order):
+  (1) blockwise/1x128 activation scales (post-GELU outliers dominate the
+  rowwise amax), (2) smoothquant-style weight/activation rebalancing,
+  (3) first/last-block bf16 exclusion, (4) fast-accum A/B. The per-site
+  sweep tool and the `ffn1` scope token exist precisely for that audit.
 
 ### Entry template (copy-paste per attempt)
 

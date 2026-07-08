@@ -20,6 +20,16 @@ except Exception:  # standalone use of utils without diffsynth on path
     def nvtx_range(name):  # noqa: ARG001
         return _NVTX_NULL
 
+try:
+    # Phase 2B-2: FP8 GEMM infrastructure (FLASHVSR_FP8_GEMM, default OFF).
+    from diffsynth.models import fp8_gemm as _fp8g
+except Exception:  # standalone use without diffsynth on path
+    class _Fp8Disabled:
+        @staticmethod
+        def enabled(site):  # noqa: ARG004
+            return False
+    _fp8g = _Fp8Disabled()
+
 
 CACHE_T = 2
 
@@ -474,8 +484,17 @@ class Causal_LQ4x_Proj(nn.Module):
                 x = self.act2(x)
                 out_x = rearrange(x, 'b c f h w -> b (f h w) c')
                 with nvtx_range("lq_linears"):
-                    outputs = []
-                    for i in range(self.layer_num):
-                        outputs.append(self.linear_layers[i](out_x))
+                    if _fp8g.enabled("lq"):
+                        # 2B-2: all 30 per-layer linears consume the same
+                        # activation -> one shared quantization, 30 e4m3 GEMMs.
+                        pre = _fp8g.quant(out_x.reshape(-1, out_x.shape[-1]))
+                        outputs = [
+                            _fp8g.linear(self.linear_layers[i], out_x, pre=pre)
+                            for i in range(self.layer_num)
+                        ]
+                    else:
+                        outputs = []
+                        for i in range(self.layer_num):
+                            outputs.append(self.linear_layers[i](out_x))
                 self.clip_idx += 1
                 return outputs
