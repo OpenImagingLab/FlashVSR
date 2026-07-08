@@ -37,6 +37,20 @@ _FP8_SCOPE = frozenset(
     os.environ.get("FLASHVSR_FP8_GEMM_SCOPE", "qkv,o,ffn,lq").split(",")
     if s.strip()
 )
+# Phase 4B: rowwise (2B-2) vs blockwise (DeepSeek-style 1x128 activation +
+# 1x128 weight scales via torch._scaled_mm_v2). Blockwise captures per-128-K
+# activation outliers (the post-GELU spikes that pinned rowwise at 40.7 dB),
+# targeting the >=49 dB enable gate. Requires cublasLt >=12.9 + sm_90.
+_FP8_MODE = os.environ.get("FLASHVSR_FP8_GEMM_MODE", "rowwise").lower()
+# Quality-probe switch: eager group-quant (correct but slow) so the >=49 dB
+# gate can be measured before investing in the fused blockwise quant kernel.
+_FP8_BLOCKWISE_EAGER = os.environ.get("FLASHVSR_FP8_BLOCKWISE_EAGER", "1") != "0"
+
+try:
+    from torch.nn.functional import ScalingType as _ScalingType, SwizzleType as _SwizzleType
+    _HAS_V2 = hasattr(torch, "_scaled_mm_v2")
+except Exception:
+    _HAS_V2 = False
 
 _FAILED = False  # sticky: set on first unexpected error, forces eager fallback
 
@@ -123,7 +137,12 @@ if _HAS_TRITON:
 
 
 def quant(x2d: torch.Tensor, apply_gelu: bool = False):
-    """Quantize a row-major 2D activation to (e4m3, (M,1) fp32 row scales)."""
+    """Shared activation quant. Rowwise (2B-2) or blockwise (4B) per mode."""
+    if _FP8_MODE == "blockwise":
+        if x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        return (_blockquant_eager_gelu(x2d) if apply_gelu
+                else _blockquant_eager(x2d))
     assert x2d.dim() == 2, "2D input required"
     if x2d.stride(1) != 1:
         # e.g. the LQ projector's rearrange returns a transposed view; one
@@ -158,6 +177,77 @@ def _weight_fp8(lin):
     return w8, sb
 
 
+def _blockquant_eager(x2d):
+    """Eager 1x128 group quant (quality probe). (M,K)->(e4m3 (M,K),
+    scale (M,K//128) laid out as .t() of contiguous (K//128,M))."""
+    M, K = x2d.shape
+    G = K // 128
+    xf = x2d.to(torch.float32).reshape(M, G, 128)
+    amax = xf.abs().amax(-1).clamp_(min=1e-12)          # (M,G)
+    s = amax / 448.0
+    x8 = (xf / s[..., None]).clamp_(-448.0, 448.0).to(
+        torch.float8_e4m3fn).reshape(M, K)
+    sa = s.t().contiguous().t()                          # (M,G) col-major
+    return x8, sa
+
+
+def _blockquant_eager_gelu(h2d):
+    """GELU(tanh) fused into 1x128 group quant (ffn2 input)."""
+    v = h2d.to(torch.float32)
+    v = torch.nn.functional.gelu(v, approximate="tanh")
+    return _blockquant_eager(v)
+
+
+def _weight_fp8_blockwise(lin):
+    """Lazy 1x128-along-K weight cast: b operand (K,N) col-major e4m3 +
+    scale (N,K//128) laid out as .t() of contiguous (K//128,N)."""
+    w = lin.weight
+    key = (w.data_ptr(), w.device, w.dtype, w.shape)
+    cache = getattr(lin, "_fp8_wcache_bw", None)
+    if cache is not None and cache[0] == key:
+        return cache[1], cache[2]
+    N, K = w.shape
+    G = K // 128
+    with torch.no_grad():
+        wf = w.detach().to(torch.float32).reshape(N, G, 128)
+        wamax = wf.abs().amax(-1).clamp_(min=1e-12)      # (N,G)
+        ws = wamax / 448.0
+        w8 = (wf / ws[..., None]).clamp_(-448.0, 448.0).to(
+            torch.float8_e4m3fn).reshape(N, K)
+    b8 = w8.t()                                          # (K,N) col-major
+    sb = ws.t().contiguous().t()                         # (N,G) col-major
+    lin._fp8_wcache_bw = (key, b8, sb)
+    return b8, sb
+
+
+def _mm_blockwise(x8, sa, b8, sb, bias, out_dtype):
+    return torch._scaled_mm_v2(
+        x8, b8,
+        [sa], [_ScalingType.BlockWise1x128], [_SwizzleType.NO_SWIZZLE],
+        [sb], [_ScalingType.BlockWise1x128], [_SwizzleType.NO_SWIZZLE],
+        bias, out_dtype)
+
+
+def _linear_blockwise(lin, x, pre=None):
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    if x2.stride(1) != 1:
+        x2 = x2.contiguous()
+    x8, sa = _blockquant_eager(x2) if pre is None else pre
+    b8, sb = _weight_fp8_blockwise(lin)
+    out = _mm_blockwise(x8, sa, b8, sb, lin.bias, x.dtype)
+    return out.reshape(*x.shape[:-1], b8.shape[1])
+
+
+def _ffn_blockwise(seq, x):
+    h = _linear_blockwise(seq[0], x)
+    h2 = h.reshape(-1, h.shape[-1])
+    g8, gs = _blockquant_eager_gelu(h2)
+    b8, sb = _weight_fp8_blockwise(seq[2])
+    out = _mm_blockwise(g8, gs, b8, sb, seq[2].bias, x.dtype)
+    return out.reshape(*x.shape[:-1], b8.shape[1])
+
+
 def _warn_and_disable(e):
     global _FAILED
     if not _FAILED:
@@ -170,6 +260,8 @@ def linear(lin, x: torch.Tensor, pre=None) -> torch.Tensor:
     `quant()` when several linears consume the same activation (qkv, LQ).
     Falls back to eager on any error (sticky)."""
     try:
+        if _FP8_MODE == "blockwise":
+            return _linear_blockwise(lin, x, pre=pre)
         K = x.shape[-1]
         x2 = x.reshape(-1, K)
         x8, sa = quant(x2) if pre is None else pre
@@ -187,6 +279,8 @@ def ffn(seq, x: torch.Tensor) -> torch.Tensor:
     ffn1 out stays bf16; the GELU is fused into ffn2's input quantization
     (fp32 gelu -> e4m3 directly, replacing the eager bf16 GELU pass)."""
     try:
+        if _FP8_MODE == "blockwise":
+            return _ffn_blockwise(seq, x)
         h = linear(seq[0], x)
         h2 = h.reshape(-1, h.shape[-1])
         g8, gs = quant(h2, apply_gelu=True)

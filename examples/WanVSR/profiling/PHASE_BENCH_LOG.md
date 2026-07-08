@@ -67,6 +67,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 3.5-3 | Decoder overlap × v2 remeasure | `FLASHVSR_DECODER_OVERLAP` | 46.383 | 47.239 | +1.85% | 118.84 ms | 172.9 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | inherited lossless (2B-1, backend-orthogonal); tail 543→126 ms | keep-behind-flag (co-exec 31.7% vs 34.1%; v2 did NOT free the ceiling) |
 | 2026-07-08 | 3.5-4 | RoPE freqs device cache × v2 remeasure | `FLASHVSR_CACHE_ROPE_FREQS` | 46.383 | 46.429 | +0.10% (noise) | 118.84 ms | 118.40 ms | 15.62 GiB | 15.65 GiB | lossless (2A-1a) | keep-behind-flag (still FPS-neutral @768 under v2) |
 | 2026-07-08 | 4A | RoPE fp32 (fused apply) | `FLASHVSR_ROPE_FP32` (reverted) | — | — | ~0 (x1.01 isolated) | — | — | — | — | ≤1 bf16 ULP (numerically fine) | **drop** (no speedup — rope is interleave-access-bound at ~400 GB/s, not fp64-bound) |
+| 2026-07-08 | 4B | FP8 GEMM blockwise (`_scaled_mm_v2` 1x128 act + 1x128 weight) | `FLASHVSR_FP8_GEMM_MODE=blockwise` | — | — | isolated GEMM ×1.13–1.34 | — | — | — | +1.0 GiB | full-scope PSNR **41.00 dB** (ffn 42.71 / qkv,o,lq 43.51 / lq 49.49) | keep-behind-flag, **NOT enable-eligible** (only speed-neutral `lq` clears ≥49) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -667,6 +668,45 @@ second confirming entry.
 - Real rope lever (deferred, numerics-neutral candidate): restructure the
   interleave so the complex pairs are written coalesced (or fold RoPE into the
   attention/qkv prologue). Not fp32. Filed for a later structural pass.
+
+#### 2026-07-08 · Phase 4B · FP8 GEMM blockwise (DeepSeek-style 1x128) → NOT enable-eligible at ≥49
+
+- Motivation: 2B-2 rowwise FP8 pinned at 40.70 dB full-scope (ffn the offender,
+  post-GELU per-row amax dominated by outliers). Hypothesis: 1x128 blockwise
+  activation scales isolate those outliers → clear the ≥49 gate.
+- Feasibility (verified): `torch._scaled_mm_v2` + `ScalingType.BlockWise1x128`
+  works on sm_90 (cublasLt ≥12.9, we have CUDA 13.2). Isolated pre-quantized
+  GEMM speedups: ffn1 ×1.15, ffn2 ×1.22, qkv/o ×1.13, lq ×1.34 — LOWER than
+  rowwise (×1.26–1.72) because finer scales cost more, and blockwise activation
+  quant is heavier than per-row amax.
+- Implementation: `fp8_gemm.py` gains `FLASHVSR_FP8_GEMM_MODE=rowwise|blockwise`
+  (default rowwise = 2B-2 unchanged) with eager 1x128 group-quant + weight cast
+  + `_scaled_mm_v2` routing (`_blockquant_eager`, `_weight_fp8_blockwise`,
+  `_linear_blockwise`, `_ffn_blockwise`). Eager quant kept (quality probe) — no
+  fused kernel built, see decision.
+- Quality (Phase-4 protocol, example0 @768, PSNR vs flag-OFF):
+
+  | scope | rowwise (2B-2) | blockwise (4B) | Δ |
+  |---|---|---|---|
+  | full (qkv,o,ffn,lq) | 40.70 | **41.00** | +0.30 |
+  | ffn (the speed lever) | 42.37 | **42.71** | +0.34 |
+  | qkv,o,lq | 43.42 | **43.51** | +0.09 |
+  | lq (speed-neutral) | 49.08 | **49.49** | +0.41 |
+
+- Decision: **keep-behind-flag, NOT enable-eligible.** Blockwise gives only
+  +0.1–0.4 dB everywhere — it does not solve the actual failure mode, which is
+  the distilled one-step model's e4m3 error **compounding across the 30 DiT
+  blocks through the streaming KV cache** (2B-2 finding, now confirmed
+  scale-granularity-independent). The only ≥49 scope is `lq` (49.49) which is
+  speed-neutral, so there is no enable-eligible speed-meaningful configuration
+  at the locked ≥49 gate. No fused blockwise quant kernel was built — optimizing
+  the speed of a path that cannot pass the gate is wasted work.
+- Default neutrality: mode defaults `rowwise`; with `FLASHVSR_FP8_GEMM=0`
+  (default) neither path runs — the eager/`triton`/`sparse` outputs are
+  byte-identical (fp8 code is fully gated by `enabled()`).
+- Remaining FP8-GEMM avenue (Phase-4 backlog, not this session): first/last-block
+  bf16 exclusion + smoothquant rebalancing to break the compounding — but the
+  ceiling is low given rowwise→blockwise moved only 0.3 dB.
 
 ### Entry template (copy-paste per attempt)
 
