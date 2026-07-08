@@ -733,6 +733,42 @@ second confirming entry.
   denoise-side headroom is structural/lossless (5A) or the deferred rope
   interleave; the E2E ceiling is now decode-tail bound (%32 wall).
 
+#### 2026-07-08 · Phase 5A · Zero-copy windowing — FEASIBILITY CONFIRMED, deferred
+
+- Rank-4 gluon TMA descriptor `[2,8,8,128]` over raster `(F,H,W,Hh·D)` at
+  `[f0,h0,w0,head·D]` reproduces `WindowPartition3D.partition`'s token order
+  **bit-exactly** (match=True, max|diff|=0) into a 2D `[128,D]` NVMMA smem tile
+  → WGMMA-ready. So win_part/win_rev (5.9 ms/chunk of pure permutation copies)
+  can be removed with no math change.
+- Deferred to a focused session: the integration (KV-arena raster ring +
+  mask_gen raster pooling + 4D output store + multi-chunk arena bit-stability)
+  touches the KV-cache bit-stability contract and must not be rushed. Full spec
+  in `.opencode/plans/hw-efficiency-roadmap.md` §5A. Expected −4..−6 ms/chunk,
+  lossless (max|diff|=0 gate). Flag `FLASHVSR_ATTN_ZEROCOPY`.
+
+#### 2026-07-08 · Phase 3.5–5 campaign closure (this session)
+
+- **Landed (kept):** 3.5-1a FFMA-form softmax + 3.5-2 fused CSR (both in/with
+  `triton2`). @768 OFF(triton) 41.53 → **46.38 FPS (+11.68%)**, 138.9 →
+  118.8 ms; @1536 11.46 → **12.67 FPS (+10.5%)**. Quality: kernel cos 0.999996,
+  E2E PSNR 50.08 dB, CSR bit-exact. Peak unchanged 15.62 GiB.
+- **Measured/kept-flag:** 3.5-3 decoder-overlap ×v2 +1.85% (co-exec 31.7%, the
+  v2 smem monopoly persists — a real Phase-5 dependency); 3.5-4 rope-freqs
+  cache +0.1% (noise); 4B FP8-GEMM blockwise infra (default-OFF, 41.0 dB).
+- **Dropped with evidence (saved dead-end kernel work):** 3.5-1b alpha-skip
+  (−7% isolated), 3.5-1c pingpong barrier (deadlock risk, already 83% peak),
+  4A rope-fp32 (×1.01 — interleave-bound not fp64-bound), 4C FP8-attention
+  (probe 34.96 dB, gate unreachable — attention is far more e4m3-sensitive than
+  GEMMs; no kernel written).
+- **Key finding:** the FP8 lever (GEMM + attention) is closed at the locked
+  ≥49 dB gate for this distilled one-step model — its e4m3 error compounds
+  through the streaming KV cache (4B) and softmax amplifies K errors (4C).
+  Remaining denoise headroom is structural/lossless (5A zero-copy windowing,
+  feasibility-confirmed; deferred rope-interleave); the E2E ceiling is now
+  decode-tail bound (~32% of wall).
+- **Recommended-set delta (pending 2nd confirming entry):**
+  `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1`.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
