@@ -119,6 +119,20 @@ _CACHE_MASK_BIAS = os.environ.get("FLASHVSR_CACHE_MASK_BIAS", "0") != "0"
 # ---------------------------------------------------------------------------
 _MASKGEN_LEAN = os.environ.get("FLASHVSR_MASKGEN_LEAN", "0") != "0"
 
+# ---------------------------------------------------------------------------
+# Phase 5-P2: incremental pooled-K cache (FLASHVSR_POOLED_K_CACHE, default
+# OFF). mask_gen re-pools ALL kv windows (torch.mean over 128 tokens) every
+# DiT block every chunk (~1.6 ms/chunk), but old windows' K values are
+# bit-identical across chunks (arena/cat copies) and torch.mean(dim=1) is
+# per-row deterministic INDEPENDENT of the batch row count (verified
+# bit-equal: (264,128,C) one-call == 4x(66,128,C) slices). So pool each
+# window ONCE (when new) and carry the pooled rows in a per-block rolling
+# buffer that mirrors the KV window's exact cat/trim sequence -> bit-exact
+# (E2E max|diff|==0 gated). Self-heals on any length mismatch by re-pooling
+# everything (new video, arena reset, shape change).
+# ---------------------------------------------------------------------------
+_POOLED_K_CACHE = os.environ.get("FLASHVSR_POOLED_K_CACHE", "0") != "0"
+
 # (c): persistent per-shape int32 tensors for the block_sparse_attn call.
 _SPARSE_SEQLENS_CACHE = {}
 
@@ -375,11 +389,13 @@ def _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num):
 
 @torch.no_grad()
 def generate_draft_block_mask(batch_size, nheads, seqlen,
-                              q_w, k_w, topk=10, local_attn_mask=None):
+                              q_w, k_w, topk=10, local_attn_mask=None,
+                              avgpool_k=None):
     assert batch_size == 1, "Only batch_size=1 supported for now"
     assert local_attn_mask is not None, "local_attn_mask must be provided"
     avgpool_q = torch.mean(q_w, dim=1) 
-    avgpool_k = torch.mean(k_w, dim=1)
+    if avgpool_k is None:
+        avgpool_k = torch.mean(k_w, dim=1)
     avgpool_q = rearrange(avgpool_q, 's (h d) -> s h d', h=nheads)
     avgpool_k = rearrange(avgpool_k, 's (h d) -> s h d', h=nheads)
     q_heads = avgpool_q.permute(1, 0, 2)
@@ -827,7 +843,29 @@ class SelfAttention(nn.Module):
                 self.local_attn_mask_h = h//8
                 self.local_attn_mask_w = w//8
                 self.local_range = local_range
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+            pooled_k = None
+            if _POOLED_K_CACHE and B == 1 and is_stream:
+                # 5-P2: pool only the windows appended this call; carry old
+                # rows (bit-identical values) in a rolling buffer that mirrors
+                # the kv window's cat/trim sequence exactly.
+                n_new = one_len * seqlen
+                old_rows = k_w.shape[0] - n_new
+                prev = getattr(self, "_pk_cache", None)
+                if (prev is not None and old_rows > 0
+                        and prev.shape[0] == old_rows
+                        and prev.dtype == k_w.dtype
+                        and prev.shape[1] == k_w.shape[2]):
+                    pooled_k = torch.cat(
+                        [prev, torch.mean(k_w[old_rows:], dim=1)], dim=0)
+                else:  # fresh video / reset / mismatch -> re-pool everything
+                    pooled_k = torch.mean(k_w, dim=1)
+                # mirror cache_trim below: drop the oldest temporal slot when
+                # more than kv_len slots are cached
+                if (k_w.shape[0] // one_len) > kv_len:
+                    self._pk_cache = pooled_k[one_len:]
+                else:
+                    self._pk_cache = pooled_k
+            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask, avgpool_k=pooled_k)
 
         with nvtx_range("attn_core"):
             x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
