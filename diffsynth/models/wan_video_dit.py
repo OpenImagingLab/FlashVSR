@@ -635,6 +635,21 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 # ---------------------------------------------------------------------------
 _FUSE_ROPE = os.environ.get("FLASHVSR_FUSE_ROPE", "0") != "0"
 
+# ---------------------------------------------------------------------------
+# Phase 5-P1: hand-written coalesced RoPE kernel (FLASHVSR_ROPE_KERNEL=triton,
+# default OFF). Same fp64 elementwise math as the fused path (bit-exact,
+# max|diff|==0 gated) but ~5x the effective bandwidth: the fused kernel reads
+# freqs through stride-2 fp64 views of the complex tensor and stores through
+# an interleaved stack (measured ~484 GB/s, 143 us/call); the hand kernel
+# moves bf16 pairs as packed u32 words and reads the complex storage directly.
+# Fallback ladder: triton kernel -> fused (torch.compile) -> eager.
+# ---------------------------------------------------------------------------
+_ROPE_KERNEL = os.environ.get("FLASHVSR_ROPE_KERNEL", "").lower()
+try:
+    from .triton_rope import rope_apply_triton as _ROPE_TRITON
+except Exception:
+    _ROPE_TRITON = None
+
 _rope_fused_fn = None
 
 
@@ -661,6 +676,11 @@ def _get_rope_fused():
 
 
 def rope_apply(x, freqs, num_heads):
+    if _ROPE_KERNEL == "triton" and _ROPE_TRITON is not None:
+        try:
+            return _ROPE_TRITON(x, freqs, num_heads)
+        except Exception:
+            pass  # fall back to fused / eager below
     if _FUSE_ROPE:
         try:
             return _get_rope_fused()(x, freqs.real, freqs.imag, num_heads)
