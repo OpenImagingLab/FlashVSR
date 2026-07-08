@@ -8,6 +8,7 @@ import time
 from typing import Tuple, Optional, List
 from einops import rearrange
 from .utils import hash_state_dict_keys
+from ..nvtx_utils import nvtx_range
 
 try:
     import flash_attn_interface
@@ -507,62 +508,73 @@ class SelfAttention(nn.Module):
             assert f==6, " start f must be 6"
         assert L == f * h * w, "Sequence length mismatch with provided (f,h,w)."
 
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
+        with nvtx_range("qkv_norm"):
+            q = self.norm_q(self.q(x))
+            k = self.norm_k(self.k(x))
+            v = self.v(x)
+        with nvtx_range("rope"):
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
 
-        win = (2, 8, 8)
-        q = q.view(B, f, h, w, D)
-        k = k.view(B, f, h, w, D)
-        v = v.view(B, f, h, w, D)
+        with nvtx_range("win_part"):
+            win = (2, 8, 8)
+            q = q.view(B, f, h, w, D)
+            k = k.view(B, f, h, w, D)
+            v = v.view(B, f, h, w, D)
 
-        q_w = WindowPartition3D.partition(q, win)
-        k_w = WindowPartition3D.partition(k, win)
-        v_w = WindowPartition3D.partition(v, win)
+            q_w = WindowPartition3D.partition(q, win)
+            k_w = WindowPartition3D.partition(k, win)
+            v_w = WindowPartition3D.partition(v, win)
 
         seqlen = f//win[0]
         one_len = k_w.shape[0] // B // seqlen
         if pre_cache_k is not None and pre_cache_v is not None:
-            k_w = torch.cat([pre_cache_k, k_w], dim=0)
-            v_w = torch.cat([pre_cache_v, v_w], dim=0)
+            with nvtx_range("kv_cat"):
+                k_w = torch.cat([pre_cache_k, k_w], dim=0)
+                v_w = torch.cat([pre_cache_v, v_w], dim=0)
 
         block_n = q_w.shape[0] // B
         block_s = q_w.shape[1]
         block_n_kv = k_w.shape[0] // B
 
-        reorder_q = rearrange(q_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n, block_s=block_s)
-        reorder_k = rearrange(k_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
-        reorder_v = rearrange(v_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
+        with nvtx_range("reorder"):
+            reorder_q = rearrange(q_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n, block_s=block_s)
+            reorder_k = rearrange(k_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
+            reorder_v = rearrange(v_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
 
         window_size = win[0]*h*w//128
 
-        if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
-            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
-            self.local_attn_mask_h = h//8
-            self.local_attn_mask_w = w//8
-            self.local_range = local_range
-        attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        with nvtx_range("mask_gen"):
+            if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
+                self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
+                self.local_attn_mask_h = h//8
+                self.local_attn_mask_w = w//8
+                self.local_range = local_range
+            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
 
-        x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+        with nvtx_range("attn_core"):
+            x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
-        cur_block_n, cur_block_s, _ = k_w.shape
-        cache_num = cur_block_n // one_len
-        if cache_num > kv_len:
-            cache_k = k_w[one_len:, :, :]
-            cache_v = v_w[one_len:, :, :]
-        else:
-            cache_k = k_w
-            cache_v = v_w
+        with nvtx_range("cache_trim"):
+            cur_block_n, cur_block_s, _ = k_w.shape
+            cache_num = cur_block_n // one_len
+            if cache_num > kv_len:
+                cache_k = k_w[one_len:, :, :]
+                cache_v = v_w[one_len:, :, :]
+            else:
+                cache_k = k_w
+                cache_v = v_w
 
-        x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
-        x = WindowPartition3D.reverse(x, win, (f, h, w))
-        x = x.view(B, f*h*w, D)
+        with nvtx_range("win_rev"):
+            x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
+            x = WindowPartition3D.reverse(x, win, (f, h, w))
+            x = x.view(B, f*h*w, D)
 
+        with nvtx_range("o_proj"):
+            out = self.o(x)
         if is_stream:
-            return self.o(x), cache_k, cache_v
-        return self.o(x)
+            return out, cache_k, cache_v
+        return out
 
 
 class CrossAttention(nn.Module):
@@ -653,27 +665,32 @@ class DiTBlock(nn.Module):
     def forward(self, x, context, t_mod, freqs, f, h, w, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
-        if _CACHE_MOD:
-            key = (id(t_mod), t_mod.dtype, t_mod.device)
-            if self._mod_cache_key != key:
-                self._mod_cache = (
-                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
-                ).chunk(6, dim=1)
-                self._mod_cache_key = key
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._mod_cache
-        else:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
-            input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
-            kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
-            pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
+        with nvtx_range("mod1"):
+            if _CACHE_MOD:
+                key = (id(t_mod), t_mod.dtype, t_mod.device)
+                if self._mod_cache_key != key:
+                    self._mod_cache = (
+                        self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+                    ).chunk(6, dim=1)
+                    self._mod_cache_key = key
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._mod_cache
+            else:
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+            input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        with nvtx_range("self_attn"):
+            self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
+                input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
+                kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
+                pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
 
-        x = self.gate(x, gate_msa, self_attn_output)
-        x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        with nvtx_range("gate1"):
+            x = self.gate(x, gate_msa, self_attn_output)
+        with nvtx_range("xattn"):
+            x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
+        with nvtx_range("ffn"):
+            input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+            x = self.gate(x, gate_mlp, self.ffn(input_x))
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

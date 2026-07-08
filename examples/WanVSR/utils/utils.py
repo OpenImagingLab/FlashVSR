@@ -7,6 +7,19 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import time
 
+try:
+    from diffsynth.nvtx_utils import nvtx_range
+except Exception:  # standalone use of utils without diffsynth on path
+    class _NullCtx:
+        __slots__ = ()
+        def __enter__(self):
+            return None
+        def __exit__(self, *exc):
+            return False
+    _NVTX_NULL = _NullCtx()
+    def nvtx_range(name):  # noqa: ARG001
+        return _NVTX_NULL
+
 
 CACHE_T = 2
 
@@ -341,33 +354,39 @@ class Causal_LQ4x_Proj(nn.Module):
     def stream_forward(self, video_clip):
         if self.clip_idx == 0:
             # self.clear_cache()
-            first_frame = video_clip[:, :, :1, :, :].repeat(1, 1, 3, 1, 1)
-            video_clip = torch.cat([first_frame, video_clip], dim=2)
-            x = self.pixel_shuffle(video_clip)
-            cache1_x = x[:, :, -CACHE_T:, :, :].clone()
-            x = self.conv1(x, self.cache['conv1'])
-            self.cache['conv1'] = cache1_x
-            x = self.norm1(x)
-            x = self.act1(x)
-            cache2_x = x[:, :, -CACHE_T:, :, :].clone()
-            self.cache['conv2'] = cache2_x
-            self.clip_idx += 1
-            return None
+            with nvtx_range("lq_proj0"):
+                first_frame = video_clip[:, :, :1, :, :].repeat(1, 1, 3, 1, 1)
+                video_clip = torch.cat([first_frame, video_clip], dim=2)
+                x = self.pixel_shuffle(video_clip)
+                cache1_x = x[:, :, -CACHE_T:, :, :].clone()
+                with nvtx_range("lq_conv1"):
+                    x = self.conv1(x, self.cache['conv1'])
+                self.cache['conv1'] = cache1_x
+                x = self.norm1(x)
+                x = self.act1(x)
+                cache2_x = x[:, :, -CACHE_T:, :, :].clone()
+                self.cache['conv2'] = cache2_x
+                self.clip_idx += 1
+                return None
         else:
-            x = self.pixel_shuffle(video_clip)
-            cache1_x = x[:, :, -CACHE_T:, :, :].clone()
-            x = self.conv1(x, self.cache['conv1'])
-            self.cache['conv1'] = cache1_x
-            x = self.norm1(x)
-            x = self.act1(x)
-            cache2_x = x[:, :, -CACHE_T:, :, :].clone()
-            x = self.conv2(x, self.cache['conv2'])
-            self.cache['conv2'] = cache2_x
-            x = self.norm2(x)
-            x = self.act2(x)
-            out_x = rearrange(x, 'b c f h w -> b (f h w) c')
-            outputs = []
-            for i in range(self.layer_num):
-                outputs.append(self.linear_layers[i](out_x))
-            self.clip_idx += 1
-            return outputs
+            with nvtx_range("lq_proj"):
+                x = self.pixel_shuffle(video_clip)
+                cache1_x = x[:, :, -CACHE_T:, :, :].clone()
+                with nvtx_range("lq_conv1"):
+                    x = self.conv1(x, self.cache['conv1'])
+                self.cache['conv1'] = cache1_x
+                x = self.norm1(x)
+                x = self.act1(x)
+                cache2_x = x[:, :, -CACHE_T:, :, :].clone()
+                with nvtx_range("lq_conv2"):
+                    x = self.conv2(x, self.cache['conv2'])
+                self.cache['conv2'] = cache2_x
+                x = self.norm2(x)
+                x = self.act2(x)
+                out_x = rearrange(x, 'b c f h w -> b (f h w) c')
+                with nvtx_range("lq_linears"):
+                    outputs = []
+                    for i in range(self.layer_num):
+                        outputs.append(self.linear_layers[i](out_x))
+                self.clip_idx += 1
+                return outputs

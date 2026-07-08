@@ -16,6 +16,7 @@ from ..models import ModelManager
 from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
+from ..nvtx_utils import nvtx_range
 from .base import BasePipeline
 
 
@@ -348,8 +349,21 @@ class FlashVSRTinyPipeline(BasePipeline):
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 
+        # Profiling window (FLASHVSR_NVTX tooling): cudaProfilerStart at chunk
+        # PROF_START, cudaProfilerStop after chunk PROF_STOP-1 (i.e. window is
+        # [start, stop)). Read at call time so a warmup call can run with the
+        # window disabled and the measured call can enable it via os.environ.
+        # Default -1/-1 -> disabled, zero behaviour change.
+        _prof_start = int(os.environ.get("FLASHVSR_PROFILER_START_CHUNK", "-1"))
+        _prof_stop = int(os.environ.get("FLASHVSR_PROFILER_STOP_CHUNK", "-1"))
+
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num)):
+            for cur_process_idx in progress_bar_cmd(range(process_total_num)):
+                if _prof_start >= 0 and cur_process_idx == _prof_start:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.start()
+                nvtx_chunk = nvtx_range(f"chunk{cur_process_idx}")
+                nvtx_chunk.__enter__()
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
@@ -386,46 +400,53 @@ class FlashVSRTinyPipeline(BasePipeline):
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
                 # 推理（无 motion_controller / vace）
-                noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
-                    self.dit,
-                    x=cur_latents,
-                    timestep=self.timestep,
-                    context=None,
-                    tea_cache=None,
-                    use_unified_sequence_parallel=False,
-                    LQ_latents=LQ_latents,
-                    is_full_block=is_full_block,
-                    is_stream=is_stream,
-                    pre_cache_k=pre_cache_k,
-                    pre_cache_v=pre_cache_v,
-                    topk_ratio=topk_ratio,
-                    kv_ratio=kv_ratio,
-                    cur_process_idx=cur_process_idx,
-                    t_mod=self.t_mod,
-                    t=self.t,
-                    local_range = local_range,
-                )
+                with nvtx_range("dit_forward"):
+                    noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
+                        self.dit,
+                        x=cur_latents,
+                        timestep=self.timestep,
+                        context=None,
+                        tea_cache=None,
+                        use_unified_sequence_parallel=False,
+                        LQ_latents=LQ_latents,
+                        is_full_block=is_full_block,
+                        is_stream=is_stream,
+                        pre_cache_k=pre_cache_k,
+                        pre_cache_v=pre_cache_v,
+                        topk_ratio=topk_ratio,
+                        kv_ratio=kv_ratio,
+                        cur_process_idx=cur_process_idx,
+                        t_mod=self.t_mod,
+                        t=self.t,
+                        local_range = local_range,
+                    )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
                 LQ_pre_idx = LQ_cur_idx
+                nvtx_chunk.__exit__(None, None, None)
+                if _prof_stop >= 0 and cur_process_idx == _prof_stop - 1:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
 
             latents = torch.cat(latents_total, dim=2)
 
             # Decode
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+            with nvtx_range("decode"):
+                frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
 
             # 颜色校正（wavelet）
             try:
                 if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
+                    with nvtx_range("color_fix"):
+                        frames = self.ColorCorrector(
+                            frames.to(device=LQ_video.device),
+                            LQ_video[:, :, :frames.shape[2], :, :],
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method='adain'
+                        )
             except:
                 pass
 
@@ -507,7 +528,8 @@ def model_fn_wan_video(
     **kwargs,
 ):
     # patchify
-    x, (f, h, w) = dit.patchify(x)
+    with nvtx_range("patchify"):
+        x, (f, h, w) = dit.patchify(x)
 
     win = (2, 8, 8)
     seqlen = f // win[0]
@@ -518,18 +540,19 @@ def model_fn_wan_video(
     kv_len = int(kv_ratio)
 
     # RoPE 位置（分段）
-    if cur_process_idx == 0:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    else:
-        freqs = torch.cat([
-            dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    with nvtx_range("rope_freqs"):
+        if cur_process_idx == 0:
+            freqs = torch.cat([
+                dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        else:
+            freqs = torch.cat([
+                dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # TeaCache（默认不启用）
     tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False
@@ -548,27 +571,30 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
-            if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
-            x, last_pre_cache_k, last_pre_cache_v = block(
-                x, context, t_mod, freqs, f, h, w,
-                local_num, topk,
-                block_id=block_id,
-                kv_len=kv_len,
-                is_full_block=is_full_block,
-                is_stream=is_stream,
-                pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
-                pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
-                local_range = local_range,
-            )
-            if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
-            if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
+            with nvtx_range(f"blk{block_id}"):
+                if LQ_latents is not None and block_id < len(LQ_latents):
+                    x = x + LQ_latents[block_id]
+                x, last_pre_cache_k, last_pre_cache_v = block(
+                    x, context, t_mod, freqs, f, h, w,
+                    local_num, topk,
+                    block_id=block_id,
+                    kv_len=kv_len,
+                    is_full_block=is_full_block,
+                    is_stream=is_stream,
+                    pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
+                    pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+                    local_range = local_range,
+                )
+                if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
+                if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
 
-    x = dit.head(x, t)
+    with nvtx_range("head"):
+        x = dit.head(x, t)
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import get_sp_group
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
-    x = dit.unpatchify(x, (f, h, w))
+    with nvtx_range("unpatchify"):
+        x = dit.unpatchify(x, (f, h, w))
     return x, pre_cache_k, pre_cache_v
