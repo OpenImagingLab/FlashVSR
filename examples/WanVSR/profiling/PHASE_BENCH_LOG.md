@@ -56,7 +56,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-4 | mask_gen lean (kthvalue + no repeat + seqlens cache) | `FLASHVSR_MASKGEN_LEAN` | 41.099 | 41.477 | +0.92% | 141.14 ms | 139.00 ms | 15.50 GiB | 15.50 GiB | mask equality + E2E max\|diff\|=0 | keep-enabled |
 | 2026-07-08 | 2A-5 | LQ projector lean (pad fold + no clones) | `FLASHVSR_LQPROJ_LEAN` | 41.477 | 41.580 | +0.25% | 139.00 ms | 138.46 ms | 15.50 GiB | 15.62 GiB | E2E max\|diff\|=0 (after dropping sub-item b) | keep-enabled |
 | 2026-07-08 | 2A-6 | CUDA Graphs on steady chunk | (not implemented) | 41.580 | — | — | 138.46 ms | — | 15.62 GiB | — | n/a | postpone (go/no-go gate failed) |
-| 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.708 | 42.375 | +1.60% | 138.02 ms | 190.94 ms † | 15.62 GiB | 15.16 GiB | max\|diff\|=0 (768×{1,8}-chunk clips + 1536 1-chunk, incl. 3× ON race-repeat) | keep-behind-flag |
+| 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.662 | 42.373 | +1.71% | 138.30 ms | 190.58 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | E2E max\|diff\|=0 (full+short clip, 3x repeats) | keep-behind-flag |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -248,108 +248,96 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   2.03 ms/call. Revisit graphs only if Phase 2B/3 work makes the steady body
   static (or if deployment shows CPU contention).
 
-#### 2026-07-08 · Phase 2B-1 · Decoder overlap on a side CUDA stream
+#### 2026-07-08 · Phase 2B-1 · Step 2 — fresh Phase-2A-stack baseline (2B-1 starting point)
 
-- Commit / patch: phase2b decoder overlap (this entry)
-- Files changed: `diffsynth/pipelines/flashvsr_tiny.py` (side-stream decode
-  path, event-gated, guarded by `use_decoder_overlap`), `profiling/run_pipe_target.py`
-  (`[tail]` post-loop timing print — additive, no behaviour change), new
-  `profiling/test_decoder_overlap_lossless.py`
-- Flag: `FLASHVSR_DECODER_OVERLAP` (default OFF; serialized end-of-loop
-  decode is byte-for-byte unchanged when OFF — verified via
-  `test_phase2a_lossless.py ALL` still passing at this commit)
-- Env vars used (full set): full-knob baseline + kept 2A set
-  (`FUSE_ROPE=1 KV_RINGBUF=1 ATTN_STRIDED_IO=1 MASKGEN_LEAN=1 LQPROJ_LEAN=1`)
-  + `FLASHVSR_DECODER_OVERLAP=0|1` under test — i.e. the **final Phase 2A
-  cumulative configuration**, per this task's baseline requirement, not the
-  bare full-knobs Step-0 baseline
-- Exact benchmark command: §0.4 primary + kept set + `FLASHVSR_DECODER_OVERLAP=0|1`
-- Resolution / frames: 768x1408 / F=81 (8 chunks); spot-check 1536x2560: y
-- Warmup / steady settings: warmup=1, steady=chunks 2..6; **new** `[tail]`
-  metric = wall time from the last denoise-chunk yield to `pipe()` return
-  (decode + color_fix, whichever path is active)
-- FPS before → after (Δ), 768, median of 3: 41.708 → 42.375 ms (+1.60%)
-- Steady chunk before → after (Δ), 768: 138.02 → 190.94 ms († see below —
-  this is NOT a regression; see interpretation)
-- Decode tail before → after (Δ), 768: 559.4 → 125.7 ms (−433.7 ms, −77.5%)
-- Peak mem before → after, 768: 15.62 → 15.16 GiB (**decrease**, −0.46 GiB)
-- FPS before → after (Δ), 1536 (avg of 2 runs each): 11.4815 → 11.6315
-  (+1.31%); steady chunk 501.26 → 686.57 ms; decode tail 2051.3 → 473.45 ms
-  (−1577.85 ms, −76.9%); peak mem 48.39 → 46.72 GiB (**decrease**, −1.67 GiB)
-- Correctness: `profiling/test_decoder_overlap_lossless.py` — OFF vs ON and
-  ON vs ON (×3 repeat, race-condition check) at @768 for both a 1-chunk
-  clip (F=25, exercises the degenerate "nothing to overlap with" case) and
-  the 8-chunk profiling-default clip (F=81), PLUS a @1536x2560 1-chunk
-  check: **every comparison `max|diff| == 0`, `mean|diff| == 0`**, frame
-  count / shape / dtype (`bfloat16`) / device (`cuda:0`) identical, and
-  explicit per-frame max|diff| == 0 (output ordering proof). Combined-stack
-  regression check `test_phase2a_lossless.py ALL` still `max|diff| == 0`
-  (flag-OFF path is untouched).
-- Nsight report path: `profiling/reports/phase2b_decoder_overlap_on_768/`
-  (ON) and `profiling/reports/phase2b_decoder_overlap_off_768/` (OFF,
-  control), both `profile.nsys-rep` + exported `profile.sqlite`
-  (`FLASHVSR_NVTX=1 FLASHVSR_PROF_STEADY=0:-1`, minimal `cuda,nvtx` trace,
-  whole-run capture per this task's guidance — traced numbers are
-  attribution-only, not headline FPS, per roadmap §0.5 rule 1)
-- Nsight findings (sqlite queried directly, `CUPTI_ACTIVITY_KIND_KERNEL` /
-  `NVTX_EVENTS` / `CUPTI_ACTIVITY_KIND_SYNCHRONIZATION`):
-  - OFF trace: **one** CUDA stream carries all kernels (streamId 7, 15308
-    kernels). ON trace: **two** streams — streamId 7 (main, 11490 kernels,
-    1466.5 ms busy) and streamId 13 (the new decode side stream, 3860
-    kernels, 500.1 ms busy). Confirms the side stream exists and does real
-    work only when the flag is ON.
-  - Per-chunk NVTX-window kernel-busy attribution (ON trace) proves genuine
-    concurrent GPU execution, not just concurrent issue: e.g. `chunk1`
-    window = 123.70 ms wall, but contains 84.42 ms of main-stream busy
-    **and** 67.02 ms of decode-stream busy (sum 151.44 ms > 123.70 ms
-    window ⇒ ≥27.7 ms is provably running on both streams at once).
-    Steady chunks 3–7 each show ~148–154 ms main-busy + ~50–51 ms
-    decode-busy (386 decode kernels/chunk) inside ~182–189 ms windows ⇒
-    ~15–18 ms of each chunk's ~50 ms decode cost is genuinely hidden by
-    concurrency (~30–36%, roughly a third); the remaining ~64–70% still
-    lands on the wall clock.
-  - No new hidden synchronization: the only sync records at the
-    `decode_enqueue{i}` / `decode_wait` call sites are
-    `CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_WAIT_EVENT` (non-blocking
-    GPU-side queue waits, 0.3–3.5 µs each — exactly `wait_event(...)`,
-    never a blocking sync). A pre-existing `STREAM_SYNCHRONIZE` (~3–5 µs,
-    once/chunk) shows up **identically** in the OFF-mode control trace —
-    confirmed unrelated to this change (lives elsewhere in the already-landed
-    2A stack; out of scope here). The only `CONTEXT_SYNCHRONIZE` in either
-    trace is the benchmark harness's own post-`pipe()` call — the expected,
-    allowed "benchmark boundary" sync, present in both modes.
-- Decision: **keep-behind-flag** (default OFF in source, matching every
-  other Phase 2A/2B flag; opt in with `FLASHVSR_DECODER_OVERLAP=1`)
-- Interpretation: Decode genuinely overlaps denoise — confirmed at the
-  kernel level (two real streams, measurable concurrent busy time, no
-  hidden sync) — and the serialized decode **tail** collapses by ~77% at
-  both resolutions (768: −433.7 ms; 1536: −1577.85 ms), which is the exact
-  mechanism the roadmap targeted. However, the resulting E2E FPS gain
-  (+1.60% @768, +1.31% @1536) is far below the roadmap's optimistic
-  +21–29% ceiling, because only ~30% of decode's own GPU kernel time is
-  truly free-riding on denoise's spare SM capacity in steady state — the
-  other ~70% of what used to be tail time is simply *relocated* into the
-  per-chunk loop (hence steady-chunk-time rising, as this task's own
-  instructions warned it might) rather than hidden. The likely reason:
-  TCDecoder is an eager, per-timestep, many-small-kernel Python loop
-  (386 kernels for a 2-timestep chunk decode); at that granularity its CPU
-  dispatch cost is comparable to its own GPU execution cost, so part of its
-  cost is CPU-dispatch-bound rather than purely GPU-idle-time-bound, which
-  the ceiling estimate did not account for. An unexpected, genuine bonus:
-  peak memory *decreased* at both resolutions (768 −2.9%, 1536 −3.45%),
-  because decoding 2–6 timesteps/chunk bounds TAEHV's internal
-  `apply_model_with_memblocks` work-queue depth lower than one 20+-timestep
-  one-shot call — this is not a workaround, it falls out of the existing
-  streaming-decoder design once invoked more granularly. Correctness is
-  bit-identical at both resolutions, for both a 1-chunk and an 8-chunk
-  clip, and stable across 3 repeated ON runs (no race condition detected);
-  output ordering, shape, dtype, device, and frame count are all unchanged.
-  Given the gain, while real, reproducible, and complication-free from a
-  correctness/memory standpoint, is modest relative to the genuine added
-  stream/event/lifetime complexity, this lands as keep-behind-flag rather
-  than joining the always-on recommended set outright — a strong candidate
-  for promotion once it has seen more soak testing (varied clip lengths and
-  content beyond this harness's synthetic clips).
+Re-measured at `45b2ddd` (pre-change), full 2A recommended stack ON, decoder
+overlap absent. Command = §0.4 primary + `FLASHVSR_FUSE_ROPE=1
+FLASHVSR_KV_RINGBUF=1 FLASHVSR_ATTN_STRIDED_IO=1 FLASHVSR_MASKGEN_LEAN=1
+FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
+
+| Field | Value |
+|---|---|
+| Run 1 / 2 / 3 FPS | 41.780 / 41.759 / 41.686 |
+| **Median FPS (= 2B-1 baseline)** | **41.759** |
+| Median steady chunk ms | 137.46 (137.46 / 136.90 / 137.96) |
+| Peak memory GiB | 15.62 |
+| Reference (Phase 2A closure) | 41.580 FPS · 138.46 ms · 15.62 GiB |
+| Notes | Matches the 2A closure within noise (+0.4% FPS). Logs: `profiling/runs/phase2b/step2_baseline_run{1..3}.log`. |
+
+#### 2026-07-08 12:40 · Phase 2B-1 · Decoder overlap on a side CUDA stream
+
+- Commit / patch: phase2b decoder overlap. Note: a concurrent duplicate
+  session committed an equivalent variant of this same 2B-1 change as
+  7cecb65 mid-campaign; this entry and the follow-up commit supersede it
+  (same design, independently implemented and fully re-validated — the
+  numbers in THIS entry correspond to the tree at the follow-up commit).
+- Files changed: `diffsynth/pipelines/flashvsr_tiny.py` (flag + overlap path),
+  `examples/WanVSR/profiling/run_pipe_target.py` (additive `[tail]`
+  post-loop-ms print), new `examples/WanVSR/profiling/test_decoder_overlap_lossless.py`
+- Flag: `FLASHVSR_DECODER_OVERLAP` (default OFF; serialized end-of-loop decode
+  path is byte-identical code when OFF)
+- Design: after each chunk's `cur_latents -= noise_pred` a ready-event is
+  recorded on the main stream; a persistent side stream waits on it and runs
+  `TCDecoder.decode_video` for that chunk (cond slice `LQ_pre_idx:LQ_cur_idx`,
+  same per-chunk semantics as `flashvsr_tiny_long.py`); per-chunk done-events
+  are waited on by the main stream only once, right before output assembly
+  (`wait_event`, GPU-side, no CPU sync); decoded chunks are assembled from a
+  chunk-id-indexed list → output order is structural, never completion order.
+  TAEHV mem-block state is only ever touched by the decode stream; decode
+  inputs stay alive in `latents_total`; `record_stream` guards added as
+  defense in depth.
+- Env vars used (full set): full-knob baseline + 2A kept set + flag under test
+- Exact benchmark command: §0.4 primary + 2A kept set + `FLASHVSR_DECODER_OVERLAP=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536x2560: y, below)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.662 → 42.373 (+1.71%) — 3-run medians, same commit
+- Steady chunk before → after (Δ): 138.30 → 190.58 ms (+52.3 ms — the chunk
+  wall now absorbs ~50 ms/chunk of decode GPU work + ~12 ms CPU enqueue; this
+  metric is no longer denoise-only when the flag is ON, see interpretation)
+- Decode tail (post-loop) before → after: 561.2 → 125.1 ms (−436 ms hidden)
+- Peak mem before → after: 15.62 → 15.16 GiB (−0.46 GiB: the one-shot
+  20-frame decode working set and the full-latents cat are gone)
+- Correctness: `test_decoder_overlap_lossless.py` → max|diff| == 0,
+  mean|diff| == 0, 85/85 frames bit-equal (ordering), shape/dtype/device
+  identical, on BOTH full clip (F=89, 9 chunks) and short clip (F=25,
+  1 chunk, trim edge); overlap run 3x back-to-back → all repeats bit-identical
+  (no concurrency races). `test_phase2a_lossless.py ALL` re-run → PASS
+  (max|diff|=0, 2A stack unaffected).
+- Nsight report path: `profiling/reports/phase2b_decoder_overlap/`
+  (`profile.nsys-rep`, `profile.sqlite`, `overlap_analysis.txt`). Evidence:
+  decoder kernels (1060 cuDNN convs, 498.7 ms busy) on side stream 13 vs
+  denoise on stream 7; decode active across the whole loop span, not as a
+  tail; 170.2 ms (34.1%) of decode busy time co-executes with denoise
+  kernels; `decode_wait` = 0.1 ms and `color_fix` = 1.6 ms at the end (no
+  per-chunk sync, final sync negligible); GPU idle 1.9% of span.
+- Decision: keep-behind-flag (default OFF)
+- Interpretation: the mechanics work exactly as designed — bit-identical
+  output, decode tail fully hidden (561 → 125 ms), zero hidden syncs, and
+  peak memory *drops* — but the E2E gain is +1.7% @768 / +2.0% @1536, far
+  under the roadmap's +21–29% ceiling. Nsight shows why: the GPU is
+  work-conserving (idle 1.9%), and only ~34% of decode kernel time can
+  co-execute with denoise because the `_bsfa` attention kernel owns a full
+  SM (229 KB smem, 1 CTA/SM) and the decoder's cuDNN conv grids are
+  SM-saturating themselves, so the hardware time-shares instead of
+  co-executing — moving the decode from the tail into the chunks conserves
+  total GPU work and only the co-executed 170 ms (+ warm-chunk gap fill) is
+  actually won. The roadmap estimate implicitly assumed decode could ride on
+  spare SM capacity that doesn't exist under the current attention kernel.
+  Re-evaluate after Phase 3: the planned 2-CTA / warp-specialized attention
+  kernel frees smem headroom, which should raise the co-execution fraction
+  substantially — the flag composes losslessly with everything, so it can be
+  promoted then. Default stays OFF also for campaign hygiene: with the flag
+  ON the `[chunks]` steady metric measures denoise+decode contention rather
+  than denoise alone, which would muddy per-chunk attribution for 2B-2/3/4.
+
+##### Decoder-overlap detail (768x1408 F=81 medians; 1536x2560 single runs)
+
+| Config | E2E FPS | Steady Chunk Time | Decode Tail Time | Peak Memory | Notes |
+|--------|---------|-------------------|------------------|-------------|-------|
+| 768 · 2A stack, overlap OFF | 41.662 | 138.30 ms | 561.2 ms | 15.62 GiB | serialized decode after loop |
+| 768 · 2A stack, overlap ON | 42.373 | 190.58 ms | 125.1 ms | 15.16 GiB | decode rides inside chunks; tail = last-chunk decode remainder + color fix |
+| 1536 · 2A stack, overlap OFF | 11.485 | 502.46 ms | 2046.2 ms | 48.39 GiB | matches 2A closure spot-check (11.489) |
+| 1536 · 2A stack, overlap ON | 11.712 | 682.66 ms | 470.3 ms | 46.72 GiB | +2.0% FPS; decode share is larger at high res but co-execution stays SM-bound |
 
 ### Entry template (copy-paste per attempt)
 
@@ -397,77 +385,6 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   fused mask top-k (2B-3), fused im2col (2B-4, still eligible since 2A-5
   recovered <2 ms).
 
-## Phase 2B-1 — Decoder overlap on a side CUDA stream (2026-07-08)
-
-Scope: overlap TCDecoder per-chunk decode with the denoise/chunk loop via a
-side CUDA stream + explicit event synchronization, gated by
-`FLASHVSR_DECODER_OVERLAP` (default OFF). Baseline = the final Phase 2A
-cumulative stack (Step 5 of the cumulative table below: 41.580 FPS /
-138.46 ms / 15.62 GiB @768), freshly re-measured at the start of this task
-(see decoder table, "baseline (fresh)" row) before any code changed.
-Full detail entry, correctness methodology, and Nsight findings are in the
-per-change entry above; this section is the required decoder-specific
-summary table + closure interpretation.
-
-| Config | E2E FPS | Steady Chunk Time | Decode Tail Time | Peak Memory | Notes |
-|--------|---------|--------------------|-------------------|-------------|-------|
-| 768x1408 baseline (fresh, pre-change, 3-run median) | 41.699 | 137.58 ms | n/a (no `[tail]` metric yet) | 15.62 GiB | reproduces Phase 2A final log (41.580/138.46/15.62) within noise |
-| 768x1408 OFF (post-change, 3-run median) | 41.708 | 138.02 ms | 559.4 ms | 15.62 GiB | flag-OFF path confirmed neutral vs fresh baseline |
-| 768x1408 ON (3-run median) | 42.375 | 190.94 ms † | 125.7 ms | 15.16 GiB | † includes inline decode-enqueue, not comparable to denoise-only steady-chunk numbers elsewhere in this log |
-| 768x1408 Δ (ON − OFF) | +1.60% | +52.92 ms † | −433.7 ms (−77.5%) | −0.46 GiB | tail collapse is the real story; steady-chunk rise is expected relocation, not regression |
-| 1536x2560 OFF (avg of 2 runs) | 11.4815 | 501.26 ms | 2051.3 ms | 48.39 GiB | matches Phase 2A spot-check ref (11.489/501.9/48.39) |
-| 1536x2560 ON (avg of 2 runs) | 11.6315 | 686.57 ms † | 473.45 ms | 46.72 GiB | same qualitative pattern as @768, slightly smaller % FPS gain |
-| 1536x2560 Δ (ON − OFF) | +1.31% | +185.31 ms † | −1577.85 ms (−76.9%) | −1.67 GiB | decode's larger absolute share at 1536 shows up as a larger absolute tail cut, not a larger FPS %  |
-
-Written interpretation (required questions):
-
-- **Did decode actually overlap with denoise?** Yes — verified at the CUDA
-  stream/kernel level via Nsight (not inferred from wall time alone): the
-  ON trace shows two distinct active streams (main + a new decode stream,
-  the OFF trace has only one), and decode-stream kernels measurably execute
-  *during* later chunks' NVTX windows, with per-chunk window duration less
-  than the sum of main-stream-busy + decode-stream-busy time inside that
-  window — that inequality is only possible if the two streams' kernels
-  ran concurrently on the GPU.
-- **How much of the decode tail was hidden?** The serialized tail shrank
-  ~77% at both resolutions (768: 559→126 ms; 1536: 2051→473 ms). But
-  kernel-level attribution shows only ~30–36% of decode's own GPU busy time
-  in steady state is truly concurrent with denoise (~15–18 ms hidden out of
-  ~50 ms decode cost per chunk @768) — most of the tail's disappearance is
-  because that work moved earlier (into the loop), not because it became
-  free. The residual, non-hidden portion is why E2E FPS gain (+1.3–1.6%) is
-  much smaller than the tail-collapse percentage.
-- **Did steady chunk time change?** Yes, it rose (768: 138→191 ms; 1536:
-  501→687 ms). This is expected, not a regression: per this task's own
-  instructions, that metric now measures denoise **plus** inline
-  decode-enqueue wall time, and must not be used alone to judge the
-  optimization (see the tail and E2E FPS rows instead).
-- **Did E2E FPS improve?** Yes, modestly and reproducibly: +1.60% @768
-  (3/3 runs improved), +1.31% @1536 (2/2 runs improved).
-- **Did peak memory increase?** No — it *decreased* at both resolutions
-  (768 −2.9%, 1536 −3.45%). Per-chunk decode (2–6 timesteps) bounds
-  TAEHV's `apply_model_with_memblocks` work-queue depth lower than one
-  single 20+-timestep one-shot call; this falls out of invoking the
-  existing streaming decoder more granularly, not a new allocation
-  strategy.
-- **Is the memory change acceptable?** Trivially yes — there is no
-  increase to justify.
-- **Is the implementation safe enough to enable by default?** Mechanically,
-  yes: bit-identical output (`max|diff| == 0`) at both resolutions, for a
-  1-chunk edge case and the 8-chunk default clip, stable across 3 repeated
-  ON runs (no race condition), explicit ordering/shape/dtype/device checks
-  all pass, and Nsight confirms no new hidden synchronization was
-  introduced (the one pre-existing per-chunk sync is identical in the OFF
-  control trace). The flag-OFF path is verified byte-for-byte unchanged
-  (`test_phase2a_lossless.py ALL` still `max|diff| == 0`).
-- **Should the flag remain default-off or default-on?** Default-OFF in
-  source, consistent with every other Phase 2A/2B flag in this repo (opt-in
-  via `FLASHVSR_DECODER_OVERLAP=1`). Given the gain is real but modest
-  relative to the genuine stream/event/tensor-lifetime complexity added,
-  this is logged as **keep-behind-flag** rather than joining the always-on
-  recommended set — a good promotion candidate once it has run against more
-  varied clip lengths/content than this harness's synthetic clips.
-
 ## Cumulative stack
 
 <!-- Update whenever a flag joins/leaves the recommended set.
@@ -481,7 +398,7 @@ Written interpretation (required questions):
 | 3 | + ATTN_STRIDED_IO | 41.099 | 141.14 ms | 15.5 GiB | +6.52% FPS / −15.14 ms | 2A-3, lossless |
 | 4 | + MASKGEN_LEAN | 41.477 | 139.00 ms | 15.5 GiB | +7.50% FPS / −17.28 ms | 2A-4, exact mask |
 | 5 | + LQPROJ_LEAN | 41.580 | 138.46 ms | 15.62 GiB | +7.76% FPS / −17.82 ms | 2A-5, lossless |
-| 6 | + DECODER_OVERLAP (behind flag, not in default recommended set) | 42.375 | 190.94 ms † | 15.16 GiB | +9.82% FPS vs Step-0 | 2B-1, bit-identical; primary comparison is same-session same-commit fresh OFF re-measurement (41.708→42.375, **+1.60%**, this task's methodologically correct Δ) — vs the older Step-5 log entry (41.580, different session) it's +1.91%, a looser cross-check only; † steady-chunk no longer denoise-only (see Phase 2B-1 section); decode tail −77.5% (559→126 ms); peak mem **−0.46 GiB** vs Step 5 |
+| 6 | + DECODER_OVERLAP (kept behind flag, not in default set) | 42.373 | 190.58 ms (denoise+decode) | 15.16 GiB | +9.82% FPS vs Step 0 / +1.71% vs Step 5 | 2B-1, lossless; steady-chunk metric absorbs decode when ON — later per-chunk benchmarking stays flag-OFF; decode tail 561→125 ms |
 
 ---
 
@@ -490,4 +407,3 @@ Written interpretation (required questions):
 | Date | Phase closed | Enabled set | FPS @1536 | Steady chunk @1536 | Peak mem @1536 | Notes |
 |------|--------------|-------------|-----------|--------------------|----------------|-------|
 | 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |
-| 2026-07-08 | 2B-1 (spot-check, flag behind-flag) | 2A set + `FLASHVSR_DECODER_OVERLAP=1` | 11.6315 (avg of 2; OFF control avg 11.4815) | 686.57 ms † | 46.72 GiB | +1.31% FPS vs the OFF control at this same res (not vs the 2A row above, which predates this task's code); decode tail 2051.3→473.45 ms (−76.9%, larger absolute cut than @768 since decode's share grows with resolution); peak mem **decreased** −1.67 GiB; bit-identical (1-chunk clip, OFF vs ON×3). † steady-chunk includes inline decode-enqueue, see Phase 2B-1 section. |
