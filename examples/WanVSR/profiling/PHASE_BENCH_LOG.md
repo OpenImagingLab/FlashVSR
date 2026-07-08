@@ -50,6 +50,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | Date | Phase | Optimization | Flag | FPS Before | FPS After | Delta | Steady Chunk Before | Steady Chunk After | Peak Mem Before | Peak Mem After | Correctness | Decision |
 |------|-------|--------------|------|------------|-----------|-------|---------------------|--------------------|-----------------|----------------|-------------|----------|
 | 2026-07-08 | 2A-1a | RoPE freqs device cache | `FLASHVSR_CACHE_ROPE_FREQS` | 38.585 | 38.592 | +0.02% | 156.28 ms | 156.30 ms | 12.60 GiB | 12.63 GiB | max\|diff\|=0 (bit-identical) | keep-behind-flag |
+| 2026-07-08 | 2A-1b | Fused RoPE apply | `FLASHVSR_FUSE_ROPE` | 38.585 | 39.023 | +1.14% | 156.28 ms | 153.62 ms | 12.60 GiB | 12.60 GiB | max\|diff\|=0 (bit-identical) | keep-enabled |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -73,6 +74,31 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   removes per-chunk CPU tensor construction + an 8.6 MB H2D, which matters for
   CPU-loaded deployments and is a precondition for CUDA-graph capture (2A-6),
   so it stays available behind its flag rather than being reverted.
+
+#### 2026-07-08 09:25 · Phase 2A-1b · Fused RoPE apply
+
+- Commit / patch: phase2a fused rope apply
+- Files changed: `diffsynth/models/wan_video_dit.py` (`rope_apply` + compiled impl)
+- Flag: `FLASHVSR_FUSE_ROPE` (default OFF)
+- Env vars used (full set): full-knob baseline + `FLASHVSR_FUSE_ROPE=1`
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_FUSE_ROPE=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 38.585 → 39.023 (+1.14%) — 3-run medians
+- Steady chunk before → after (Δ): 156.28 → 153.62 ms (−2.66 ms)
+- Peak mem before → after: 12.60 → 12.60 GiB
+- Correctness: kernel-level max|diff|=0 on real shape; E2E
+  `test_phase2a_lossless.py FUSE_ROPE` → max|diff| == 0 (exceeds the ≥49 dB gate)
+- Isolated kernel: eager 0.181 ms/call → fused 0.128 ms/call (×1.41, 60 calls/chunk)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: got −2.7 ms of the −8 ms roadmap ceiling: the estimate double
+  counted freqs-side effects, and the fp64 multiply itself (not just the
+  materialized intermediates) is part of the cost, so the fused kernel is
+  compute-bound at ~0.13 ms/call rather than pure-BW ~0.02 ms. Output is
+  bit-identical since the same fp64 operations are performed in one kernel.
+  Remaining rope headroom (folding the apply into the attention prologue or
+  fp32 freqs) is Phase-4 territory (numerics change).
 
 ### Entry template (copy-paste per attempt)
 
@@ -107,7 +133,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | Step | Enabled Optimizations | FPS | Steady Chunk Time | Peak Memory | Delta vs Phase-2 Baseline | Notes |
 |------|----------------------|-----|-------------------|-------------|---------------------------|-------|
 | 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | 38.585 | 156.28 ms | 12.6 GiB | — | Step-0 fresh baseline (2026-07-08, df94d94) |
-|   |                      |     |                   |             |                           |       |
+| 1 | baseline + FUSE_ROPE | 39.023 | 153.62 ms | 12.6 GiB | +1.14% FPS / −2.66 ms | 2A-1b, lossless |
 
 ---
 

@@ -435,7 +435,56 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A-1b: fused RoPE apply (FLASHVSR_FUSE_ROPE, default OFF).
+#
+# The eager rope_apply materializes an fp64 copy of x (~104 MB @768), a
+# complex128 product (~104 MB) and a bf16 down-cast per call — 60 calls per
+# steady chunk ≈ 10 ms of pure memory traffic (ANALYSIS §1.2 "rope apply").
+# The fused path computes the *same* fp64 complex multiply in real arithmetic
+# ((a+bi)(c+di) = (ac−bd)+(ad+bc)i — exactly what the eager complex kernel
+# does) inside one torch.compile-generated kernel: reads bf16 x + fp64 freqs,
+# writes bf16 out, no fp64 intermediates hit DRAM. freqs.real / freqs.imag are
+# strided fp64 views of the complex tensor (no copy). Numerics: identical
+# operations in fp64; any FMA-contraction difference is far below the bf16
+# output quantum — gated at PSNR ≥ 49 dB vs OFF (measured max|diff| reported
+# in PHASE_BENCH_LOG.md).
+# Compiled lazily on first use so the flag can be toggled at runtime; any
+# compile/runtime failure falls back to the eager path silently.
+# ---------------------------------------------------------------------------
+_FUSE_ROPE = os.environ.get("FLASHVSR_FUSE_ROPE", "0") != "0"
+
+_rope_fused_fn = None
+
+
+def _rope_apply_fused_impl(x, f_real, f_imag, num_heads):
+    B, S, D = x.shape
+    xv = x.reshape(B, S, num_heads, -1, 2)
+    xr = xv[..., 0].to(torch.float64)
+    xi = xv[..., 1].to(torch.float64)
+    # f_real/f_imag: (S, 1, dc) fp64 views -> broadcast over (B, S, n, dc)
+    o_r = xr * f_real - xi * f_imag
+    o_i = xr * f_imag + xi * f_real
+    out = torch.stack((o_r, o_i), dim=-1)      # (B, S, n, dc, 2)
+    return out.flatten(2).to(x.dtype)          # (B, S, n*d), interleaved pairs
+
+
+def _get_rope_fused():
+    global _rope_fused_fn
+    if _rope_fused_fn is None:
+        try:
+            _rope_fused_fn = torch.compile(_rope_apply_fused_impl, dynamic=True)
+        except Exception:
+            _rope_fused_fn = _rope_apply_fused_impl
+    return _rope_fused_fn
+
+
 def rope_apply(x, freqs, num_heads):
+    if _FUSE_ROPE:
+        try:
+            return _get_rope_fused()(x, freqs.real, freqs.imag, num_heads)
+        except Exception:
+            pass  # fall back to the eager reference path below
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
