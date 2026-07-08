@@ -58,6 +58,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-6 | CUDA Graphs on steady chunk | (not implemented) | 41.580 | — | — | 138.46 ms | — | 15.62 GiB | — | n/a | postpone (go/no-go gate failed) |
 | 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.662 | 42.373 | +1.71% | 138.30 ms | 190.58 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | E2E max\|diff\|=0 (full+short clip, 3x repeats) | keep-behind-flag |
 | 2026-07-08 | 2B-2 | FP8 GEMM infra (e4m3 `_scaled_mm` + Triton rowwise quant) | `FLASHVSR_FP8_GEMM` | 41.704 | 42.986 | +3.07% | 137.98 ms | 132.96 ms | 15.62 GiB | 16.65 GiB | PSNR 40.70 dB (full scope; NOT lossless by design — Phase-4 gate) | keep-behind-flag (Phase-4 enable gate) |
+| 2026-07-08 | 2B-3 | Fused mask-gen threshold-select (Triton radix select+compare) | `FLASHVSR_FUSED_MASKGEN` (removed) | 42.00 | 41.84 | −0.4% (harness E2E) | — | — | 15.62 GiB | 15.62 GiB | mask + E2E max\|diff\|=0 (exact) | **revert** (bit-exact but performance-negative) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -398,6 +399,50 @@ FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
   rowwise amax), (2) smoothquant-style weight/activation rebalancing,
   (3) first/last-block bf16 exclusion, (4) fast-accum A/B. The per-site
   sweep tool and the `ffn1` scope token exist precisely for that audit.
+
+#### 2026-07-08 14:35 · Phase 2B-3 · Fused mask-gen threshold-select → REVERT
+
+- Commit / patch: developed on top of 3b4b23d, reverted before landing; only
+  this log entry is committed. (Run logs: `profiling/runs/phase2b2/test_fused_maskgen*.log`.)
+- Files changed (during the attempt, all removed on revert):
+  `diffsynth/models/fused_topk_mask.py` (Triton radix-select+compare kernel,
+  single-tile n<=16384 fast path + tiled variant),
+  `diffsynth/models/wan_video_dit.py` (branch in `generate_draft_block_mask`),
+  `examples/WanVSR/profiling/test_fused_maskgen_lossless.py`
+- Flag: `FLASHVSR_FUSED_MASKGEN` (removed with the revert)
+- Scope decision (pre-registered): the exact-mask gate forbids fusing
+  mean-pool/einsum/softmax (any reduction-order change flips ties across the
+  66 concatenated softmax rows whose quotients share a threshold), so the
+  exact-safe fusion is ONLY kthvalue+broadcast+compare → one kernel. The
+  selected threshold is a pure order statistic (a VALUE of the multiset), so
+  any correct selection is bit-identical — no tie-breaking ambiguity.
+- Correctness (the gate PASSED): kernel-level mask equality vs kthvalue AND
+  topk formulations on randn / heavy-tie / softmax-with--inf / all-equal /
+  negative inputs at (12|36)x13068, 12x172800, edge k∈{1,2,n/3,n−1,n} — all
+  exact; E2E max|diff| == 0 vs eager, 2 ON repeats identical.
+- Performance (the reason for the revert): isolated @12x13068,
+  k_smallest=5149: eager kthvalue+compare 59.7 µs vs fused 69.2 µs (x0.86;
+  best of num_warps sweep {4,8,16,32}: 171.6/78.5/69.0/79.7 µs; first tiled
+  version was 113 µs). Harness E2E @768 F=89: OFF 42.00 FPS → ON 41.84/41.62
+  FPS (−0.4..−0.9%). Below the pre-registered keep gate (≥ +0.5%).
+- Peak mem before → after: 15.62 → 15.62 GiB (unchanged)
+- Nsight report path: n/a (kernel-level + harness E2E evidence sufficient
+  for a negative result)
+- Decision: **revert** — code removed cleanly, no flag left behind
+- Interpretation: the roadmap's −5 ms/chunk estimate assumed fusing the
+  whole pool→einsum→softmax→topk chain to ~1 ms, but the exact-mask gate
+  makes everything upstream of the select bitwise-untouchable, and the
+  remaining exact-safe slice (select+compare, ~60 µs/call eager) has no
+  headroom: torch's `kthvalue` is already a single efficient radix-select
+  kernel (the 2A-4 lean pass already banked the topk→kthvalue win), and at
+  rows=12 a one-CTA-per-row fused kernel is latency-bound by 4 dependent
+  histogram rounds (~69 µs floor ≈ eager). The launch-gap latency the fusion
+  removes was already hidden by neighbouring kernels (2A-4 interpretation).
+  Conclusion: mask_gen (~4.4 ms/chunk) is now attention-kernel and
+  numerics-gate bound — further gains require either folding mask
+  generation into the Phase-3 attention kernel v2 or accepting non-bitwise
+  mask changes under the Phase-4 E2E-neutral protocol. 2B-4 (fused
+  im2col-GEMM) remains the only open 2B item.
 
 ### Entry template (copy-paste per attempt)
 
