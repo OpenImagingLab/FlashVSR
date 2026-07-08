@@ -128,9 +128,9 @@ if _V2_OK:
     @gluon.jit
     def _producer(q_desc, k_desc, v_desc, KVIdx, cnt, row_q, col0,
                   q_smem, k_bufs, v_bufs, q_full, k_full, k_empty,
-                  v_full, v_empty,
+                  v_full, v_empty, v_f0, nhw, nw,
                   BLOCK_N: ttgl.constexpr, HEAD_DIM: ttgl.constexpr,
-                  NBUF: ttgl.constexpr):
+                  NBUF: ttgl.constexpr, RASTER_V: ttgl.constexpr):
         # Q tile once (two 64-column TMA boxes -> one barrier).
         QBYTES: ttgl.constexpr = q_smem.type.shape[0] * HEAD_DIM * 2
         _mb.expect(q_full, QBYTES)
@@ -159,19 +159,38 @@ if _V2_OK:
             _mb.wait(v_empty.index(buf), phase)
             _mb.expect(v_full.index(buf), KVBYTES)
             vb = v_bufs.index(buf)
-            _tma.async_copy_global_to_shared(
-                v_desc, [row, col0], v_full.index(buf), vb.slice(0, 64, dim=1))
-            _tma.async_copy_global_to_shared(
-                v_desc, [row, col0 + 64], v_full.index(buf),
-                vb.slice(64, 64, dim=1))
+            if RASTER_V:
+                # 5A-v1 zero-copy: gather the (2,8,8) window straight from the
+                # raster (F,H,W,Hh*D) V arena; box order == partition order
+                # (bit-exact, probe-verified).
+                slot = kvb // nhw
+                r = kvb % nhw
+                f0 = v_f0 + slot * 2
+                h0 = (r // nw) * 8
+                w0 = (r % nw) * 8
+                _tma.async_copy_global_to_shared(
+                    v_desc, [f0, h0, w0, col0], v_full.index(buf),
+                    vb.slice(0, 64, dim=1))
+                _tma.async_copy_global_to_shared(
+                    v_desc, [f0, h0, w0, col0 + 64], v_full.index(buf),
+                    vb.slice(64, 64, dim=1))
+            else:
+                _tma.async_copy_global_to_shared(
+                    v_desc, [row, col0], v_full.index(buf),
+                    vb.slice(0, 64, dim=1))
+                _tma.async_copy_global_to_shared(
+                    v_desc, [row, col0 + 64], v_full.index(buf),
+                    vb.slice(64, 64, dim=1))
             kvb = kvb_next
 
     @gluon.jit
     def _consumer(O, cnt, scale_log2e, row_q, col_o, som, sok,
                   q_smem, k_bufs, v_bufs, q_full, k_full, k_empty,
-                  v_full, v_empty, row_off: ttgl.constexpr,
+                  v_full, v_empty, nhw, nw, hrast, wrast,
+                  row_off: ttgl.constexpr,
                   HALF_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr,
-                  HEAD_DIM: ttgl.constexpr, NBUF: ttgl.constexpr):
+                  HEAD_DIM: ttgl.constexpr, NBUF: ttgl.constexpr,
+                  RASTER_OUT: ttgl.constexpr):
         # One consumer WARPGROUP owning a HALF_M-row horizontal stripe of the
         # q block (FA3 "pingpong": two such warpgroups run the same loop on
         # different stripes; while one occupies the WGMMA pipe the other runs
@@ -244,19 +263,40 @@ if _V2_OK:
             _mb.arrive(v_empty.index(lbuf), count=1)
         l_safe = ttgl.where(l_i == 0.0, 1.0, l_i)
         acc = acc / ttgl.expand_dims(l_safe, 1)
-        offs_m = row_q + row_off + ttgl.arange(
-            0, HALF_M, ttgl.SliceLayout(1, mma))
-        offs_k = ttgl.arange(0, HEAD_DIM, ttgl.SliceLayout(0, mma))
-        ptrs = O + col_o + (ttgl.expand_dims(offs_m, 1) * som
-                            + ttgl.expand_dims(offs_k, 0) * sok)
-        ttgl.store(ptrs, acc.to(O.dtype.element_ty))
+        if RASTER_OUT:
+            # 5A-v1: store rows straight to RASTER token order (kills the
+            # win_rev reverse-partition pass). q block qb covers window
+            # (slot, hq, wq); row r in [0,128) covers (fl, hl, wl).
+            qb = row_q // 128
+            slot = qb // nhw
+            rr = qb % nhw
+            hq = (rr // nw) * 8
+            wq = (rr % nw) * 8
+            r = row_off + ttgl.arange(0, HALF_M, ttgl.SliceLayout(1, mma))
+            fl = r // 64
+            hl = (r % 64) // 8
+            wl = r % 8
+            tok = ((slot * 2 + fl) * hrast + hq + hl) * wrast + wq + wl
+            offs_k = ttgl.arange(0, HEAD_DIM, ttgl.SliceLayout(0, mma))
+            ptrs = O + col_o + (ttgl.expand_dims(tok, 1) * som
+                                + ttgl.expand_dims(offs_k, 0) * sok)
+            ttgl.store(ptrs, acc.to(O.dtype.element_ty))
+        else:
+            offs_m = row_q + row_off + ttgl.arange(
+                0, HALF_M, ttgl.SliceLayout(1, mma))
+            offs_k = ttgl.arange(0, HEAD_DIM, ttgl.SliceLayout(0, mma))
+            ptrs = O + col_o + (ttgl.expand_dims(offs_m, 1) * som
+                                + ttgl.expand_dims(offs_k, 0) * sok)
+            ttgl.store(ptrs, acc.to(O.dtype.element_ty))
 
     @gluon.jit
     def _bsfa_v2_kernel(q_desc, k_desc, v_desc, O, KVIdx, KVCnt,
                         scale_log2e, soh, som, sok, sih, sim, sic, sch, scm,
+                        v_f0, nhw, nw, hrast, wrast,
                         BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr,
                         HEAD_DIM: ttgl.constexpr, NBUF: ttgl.constexpr,
-                        PROD_REGS: ttgl.constexpr):
+                        PROD_REGS: ttgl.constexpr,
+                        RASTER_V: ttgl.constexpr, RASTER_OUT: ttgl.constexpr):
         start_m = ttgl.program_id(0)
         off_h = ttgl.program_id(1)
         cnt = ttgl.load(KVCnt + off_h * sch + start_m * scm)
@@ -294,15 +334,18 @@ if _V2_OK:
         ttgl.warp_specialize(
             [(_consumer, (O, cnt, scale_log2e, row_q, col_o, som, sok,
                           q_smem, k_bufs, v_bufs, q_full, k_full, k_empty,
-                          v_full, v_empty, 0, HALF_M, BLOCK_N, HEAD_DIM,
-                          NBUF)),
+                          v_full, v_empty, nhw, nw, hrast, wrast,
+                          0, HALF_M, BLOCK_N, HEAD_DIM,
+                          NBUF, RASTER_OUT)),
              (_consumer, (O, cnt, scale_log2e, row_q, col_o, som, sok,
                           q_smem, k_bufs, v_bufs, q_full, k_full, k_empty,
-                          v_full, v_empty, HALF_M, HALF_M, BLOCK_N, HEAD_DIM,
-                          NBUF)),
+                          v_full, v_empty, nhw, nw, hrast, wrast,
+                          HALF_M, HALF_M, BLOCK_N, HEAD_DIM,
+                          NBUF, RASTER_OUT)),
              (_producer, (q_desc, k_desc, v_desc, idx_base, cnt, row_q, col0,
                           q_smem, k_bufs, v_bufs, q_full, k_full, k_empty,
-                          v_full, v_empty, BLOCK_N, HEAD_DIM, NBUF))],
+                          v_full, v_empty, v_f0, nhw, nw,
+                          BLOCK_N, HEAD_DIM, NBUF, RASTER_V))],
             [4, 4], [232, PROD_REGS],
         )
 
@@ -346,8 +389,10 @@ def _build_call(q, k, v, bm, sm_scale, BLOCK_M=128, BLOCK_N=None):
             o.stride(1), o.stride(0), o.stride(2),
             idx.stride(0), idx.stride(1), idx.stride(2),
             cnt.stride(0), cnt.stride(1),
+            0, 1, 1, 1, 1,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D, NBUF=_NBUF,
-            PROD_REGS=_PROD_REGS, num_warps=4)
+            PROD_REGS=_PROD_REGS, RASTER_V=False, RASTER_OUT=False,
+            num_warps=4)
         return o
     return call
 
@@ -369,3 +414,58 @@ def bsfa_v2_kernel_only(q, k, v, bm, sm_scale=None):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
     return _build_call(q, k, v, bm, sm_scale)
+
+
+def triton_block_sparse_attention_v2_zc(q, k, v_buf, v_f0, hrast, wrast,
+                                        block_mask, sm_scale=None):
+    """Phase 5A-v1 zero-copy variant: V is gathered straight from the RASTER
+    (F_cap, hrast, wrast, Hh*D) arena buffer (window (2,8,8) per kv-block,
+    starting at frame `v_f0`) and the output is stored straight in RASTER
+    token order (the caller skips WindowPartition3D.reverse).
+
+    q: (Nq, H, D) window-token-major (as today), k: (Nkv, H, D) window-major.
+    Returns o: (Nq, H, D) in RASTER token order. Raises on any unsupported
+    input; caller falls back to the partitioned path.
+    """
+    assert _V2_OK, f"gluon unavailable: {_V2_ERR}"
+    BLOCK_M = 128
+    BLOCK_N = 128
+    Nq, H, D = q.shape
+    Nkv = k.shape[0]
+    assert D == 128 and Nq % 128 == 0 and Nkv % 128 == 0
+    assert q.is_contiguous() and k.is_contiguous() and v_buf.is_contiguous()
+    assert v_buf.dim() == 4 and v_buf.shape[1] == hrast and v_buf.shape[2] == wrast
+    assert v_buf.shape[3] == H * D
+    nh, nw = hrast // 8, wrast // 8
+    nhw = nh * nw
+    Nqb = Nq // 128
+    Nkvb = Nkv // 128
+    assert Nkvb % nhw == 0 and Nqb % nhw == 0
+    assert v_f0 + (Nkvb // nhw) * 2 <= v_buf.shape[0]
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+    bm = block_mask[..., :Nqb, :Nkvb]
+    assert bm.shape == (H, Nqb, Nkvb)
+    idx, cnt = _make_csr_fused(bm) if _FUSED_CSR else _make_csr(bm)
+    assert idx.stride(2) == 1
+    o = torch.empty_like(q)                    # (Nq, H, D), RASTER token order
+    scale_log2e = float(sm_scale) * 1.4426950408889634
+    layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128,
+                                    element_bitwidth=16, rank=2)
+    q_desc = _GluonTensorDescriptor.from_tensor(
+        q.view(Nq, H * D), [BLOCK_M, 64], layout)
+    k_desc = _GluonTensorDescriptor.from_tensor(
+        k.view(Nkv, H * D), [BLOCK_N, 64], layout)
+    v_desc = _GluonTensorDescriptor.from_tensor(
+        v_buf, [2, 8, 8, 64], layout)
+    grid = (Nqb, H)
+    _bsfa_v2_kernel[grid](
+        q_desc, k_desc, v_desc, o, idx, cnt, scale_log2e,
+        o.stride(1), o.stride(0), o.stride(2),
+        idx.stride(0), idx.stride(1), idx.stride(2),
+        cnt.stride(0), cnt.stride(1),
+        v_f0, nhw, nw, hrast, wrast,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D, NBUF=_NBUF,
+        PROD_REGS=_PROD_REGS, RASTER_V=True, RASTER_OUT=True,
+        num_warps=4)
+    return o

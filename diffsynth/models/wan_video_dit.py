@@ -320,6 +320,65 @@ class WindowPartition3D:
 _KV_RINGBUF = os.environ.get("FLASHVSR_KV_RINGBUF", "0") != "0"
 _KV_RINGBUF_SPARE = max(1, int(os.environ.get("FLASHVSR_KV_RINGBUF_SPARE", "2")))
 
+# ---------------------------------------------------------------------------
+# Phase 5A-v1: zero-copy V windowing (FLASHVSR_ATTN_ZEROCOPY, default OFF,
+# requires FLASHVSR_ATTN_BACKEND=triton2).
+#
+# V never feeds the mask-gen pooling, so its window-partition permute-copy
+# (arena append) and the output's reverse-partition (win_rev) are pure layout
+# work. The v2 kernel gathers each (2,8,8) V window straight from a RASTER
+# (F,h,w,C) ring arena via a rank-4 TMA box (bit-exact vs the partition path,
+# probe-verified) and stores the attention output straight in raster token
+# order. K and Q keep the partitioned layout (their pooled means feed the
+# exact-mask top-k; re-pooling from raster would change reduction order).
+# On ANY zero-copy failure the raster live view is partitioned on the fly and
+# the standard ladder (triton2 -> v1 -> sparse) runs; V's cache slot then
+# stays a _VRasterArena for the rest of the video (correct, slightly slower).
+# Gated lossless: E2E max|diff| == 0 incl. ring rotation + compaction.
+# ---------------------------------------------------------------------------
+_ATTN_ZEROCOPY = os.environ.get("FLASHVSR_ATTN_ZEROCOPY", "0") != "0"
+try:
+    from .triton_block_sparse_attn_v2 import (
+        triton_block_sparse_attention_v2_zc as _ZC_ATTN)
+except Exception:
+    _ZC_ATTN = None
+
+
+class _VRasterArena:
+    """Raster (frames, h, w, C) sliding ring for V (5A-v1 zero-copy)."""
+    __slots__ = ("buf", "start", "length")
+
+    def __init__(self, kv_len, h, w, C, dtype, device):
+        cap = (kv_len + 1 + _KV_RINGBUF_SPARE) * 2   # frames (2 per slot)
+        self.buf = torch.empty(cap, h, w, C, dtype=dtype, device=device)
+        self.start = 0
+        self.length = 0
+
+    def append(self, x):
+        """x: (1, f, h, w, C) raster. Contiguous frame copy (no permute)."""
+        f = x.shape[1]
+        cap = self.buf.shape[0]
+        if self.start + self.length + f > cap:
+            with nvtx_range("kv_cat"):
+                if self.start < self.length:
+                    tmp = self.buf[self.start:self.start + self.length].clone()
+                    self.buf[:self.length].copy_(tmp)
+                else:
+                    self.buf[:self.length].copy_(
+                        self.buf[self.start:self.start + self.length])
+                self.start = 0
+        self.buf[self.start + self.length:
+                 self.start + self.length + f].copy_(x[0])
+        self.length += f
+
+    def trim(self, frames=2):
+        self.start += frames
+        self.length -= frames
+
+    @property
+    def live(self):
+        return self.buf[self.start:self.start + self.length]
+
 
 class _KVArena:
     """Sliding-window KV arena; flows through the pre_cache_k/v slots."""
@@ -793,7 +852,34 @@ class SelfAttention(nn.Module):
         win = (2, 8, 8)
         seqlen = f//win[0]
         use_arena = _KV_RINGBUF and is_stream and B == 1
-        if use_arena:
+        use_zc = (_ATTN_ZEROCOPY and is_stream and B == 1
+                  and _ATTN_BACKEND == "triton2" and _ZC_ATTN is not None)
+        varena = None
+        if use_zc:
+            # 5A-v1: V skips window partitioning entirely — raster ring arena
+            # + rank-4 TMA gather in the kernel. K/Q keep the window layout
+            # (their pooled means feed the exact-mask top-k).
+            with nvtx_range("win_part"):
+                q = q.view(B, f, h, w, D)
+                k = k.view(B, f, h, w, D)
+                v = v.view(B, f, h, w, D)
+                q_w = WindowPartition3D.partition(q, win)
+                one_len = (h // win[1]) * (w // win[2])
+                block_tokens = win[0] * win[1] * win[2]
+                varena = pre_cache_v if isinstance(pre_cache_v, _VRasterArena) \
+                    else _VRasterArena(kv_len, h, w, D, x.dtype, x.device)
+                varena.append(v)
+                if use_arena:
+                    arena_k = pre_cache_k if isinstance(pre_cache_k, _KVArena) else \
+                        _KVArena(kv_len, one_len, block_tokens, D, x.dtype, x.device)
+                    k_w = arena_k.append_partition(k, win)
+                else:
+                    k_w = WindowPartition3D.partition(k, win)
+                    if pre_cache_k is not None:
+                        with nvtx_range("kv_cat"):
+                            k_w = torch.cat([pre_cache_k, k_w], dim=0)
+            v_w = None
+        elif use_arena:
             # 2A-2 arena path: partition K/V straight into the preallocated
             # cache; k_w/v_w are the live contiguous views (pre + new, in
             # temporal order) — bit-identical to the cat path below.
@@ -833,7 +919,7 @@ class SelfAttention(nn.Module):
         with nvtx_range("reorder"):
             reorder_q = rearrange(q_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n, block_s=block_s)
             reorder_k = rearrange(k_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
-            reorder_v = rearrange(v_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
+            reorder_v = None if use_zc else rearrange(v_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
 
         window_size = win[0]*h*w//128
 
@@ -867,11 +953,43 @@ class SelfAttention(nn.Module):
                     self._pk_cache = pooled_k
             attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask, avgpool_k=pooled_k)
 
+        zc_done = False
         with nvtx_range("attn_core"):
-            x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+            if use_zc:
+                try:
+                    bmb = attention_mask[0] if attention_mask.dim() == 4 else attention_mask
+                    hd = D // self.num_heads
+                    xh = _ZC_ATTN(
+                        reorder_q.view(-1, self.num_heads, hd),
+                        reorder_k.view(-1, self.num_heads, hd),
+                        varena.buf, varena.start, h, w, bmb.bool())
+                    x = xh.reshape(B, f * h * w, D)   # already RASTER order
+                    zc_done = True
+                except Exception:
+                    torch.cuda.empty_cache()
+                    # materialize windowed V from the raster arena and take the
+                    # standard ladder (triton2 -> v1 triton -> block_sparse)
+                    v_w = WindowPartition3D.partition(
+                        varena.live.unsqueeze(0), win)
+                    reorder_v = rearrange(
+                        v_w, '(b block_n) (block_s) d -> b (block_n block_s) d',
+                        block_n=block_n_kv, block_s=block_s)
+            if not zc_done:
+                x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
         with nvtx_range("cache_trim"):
-            if use_arena:
+            if use_zc:
+                if use_arena:
+                    if arena_k.length // one_len > kv_len:
+                        arena_k.trim(one_len)
+                    cache_k = arena_k
+                else:
+                    cache_k = k_w[one_len:, :, :] \
+                        if (k_w.shape[0] // one_len) > kv_len else k_w
+                if varena.length // 2 > kv_len:
+                    varena.trim(2)
+                cache_v = varena
+            elif use_arena:
                 # same semantics as the slice-trim below: drop the oldest
                 # temporal slot once more than kv_len slots are cached.
                 if arena_k.length // one_len > kv_len:
@@ -889,10 +1007,11 @@ class SelfAttention(nn.Module):
                     cache_k = k_w
                     cache_v = v_w
 
-        with nvtx_range("win_rev"):
-            x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
-            x = WindowPartition3D.reverse(x, win, (f, h, w))
-            x = x.view(B, f*h*w, D)
+        if not zc_done:
+            with nvtx_range("win_rev"):
+                x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
+                x = WindowPartition3D.reverse(x, win, (f, h, w))
+                x = x.view(B, f*h*w, D)
 
         with nvtx_range("o_proj"):
             # 2B-2: e4m3 o-projection (per-row activation scales).
