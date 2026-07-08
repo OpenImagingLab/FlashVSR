@@ -68,6 +68,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 3.5-4 | RoPE freqs device cache × v2 remeasure | `FLASHVSR_CACHE_ROPE_FREQS` | 46.383 | 46.429 | +0.10% (noise) | 118.84 ms | 118.40 ms | 15.62 GiB | 15.65 GiB | lossless (2A-1a) | keep-behind-flag (still FPS-neutral @768 under v2) |
 | 2026-07-08 | 4A | RoPE fp32 (fused apply) | `FLASHVSR_ROPE_FP32` (reverted) | — | — | ~0 (x1.01 isolated) | — | — | — | — | ≤1 bf16 ULP (numerically fine) | **drop** (no speedup — rope is interleave-access-bound at ~400 GB/s, not fp64-bound) |
 | 2026-07-08 | 4B | FP8 GEMM blockwise (`_scaled_mm_v2` 1x128 act + 1x128 weight) | `FLASHVSR_FP8_GEMM_MODE=blockwise` | — | — | isolated GEMM ×1.13–1.34 | — | — | — | +1.0 GiB | full-scope PSNR **41.00 dB** (ffn 42.71 / qkv,o,lq 43.51 / lq 49.49) | keep-behind-flag, **NOT enable-eligible** (only speed-neutral `lq` clears ≥49) |
+| 2026-07-08 | 4C | FP8 attention (e4m3 K/V) quality de-risk probe | `FLASHVSR_ATTN_FP8_PROBE` (reverted) | — | — | — | — | — | — | — | E2E PSNR **34.96 dB** (optimistic bound) | **drop** (gate unreachable — attention far more e4m3-sensitive than GEMMs; no kernel written) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -707,6 +708,30 @@ second confirming entry.
 - Remaining FP8-GEMM avenue (Phase-4 backlog, not this session): first/last-block
   bf16 exclusion + smoothquant rebalancing to break the compounding — but the
   ceiling is low given rowwise→blockwise moved only 0.3 dB.
+
+#### 2026-07-08 · Phase 4C · FP8 attention → DROP before kernel (quality gate unreachable)
+
+- Plan: e4m3 K/V (+ optional e4m3 P·V) on the v2 WS substrate; expected
+  −9..−11 ms/chunk. Highest single lever, but 4B just showed the model's e4m3
+  error compounds through the KV cache — a strong negative prior since FP8
+  attention puts e4m3 *directly* into that cache.
+- De-risk (no kernel): fake-quant K/V to e4m3 with per-(head, 128-kv-block)
+  amax scales in the v2 glue, kernel otherwise unchanged bf16. This is the
+  **optimistic bound** for a real kernel (no cache-storage compounding; P/PV
+  stay bf16; finest natural scale granularity). E2E `test_attention_v2` e2e:
+  PSNR(sparse, triton2+probe) = **34.96 dB**, max|d|=1.54 — far below the 45
+  revert tier, let alone the ≥49 gate.
+- Root cause: attention is much more e4m3-sensitive than the GEMMs (34.96 vs
+  40–43 dB) because softmax exponentiates QK, amplifying small K errors, and
+  the distilled one-step model has no later denoising steps to correct them.
+- Decision: **drop — do not write the FP8-attention kernel.** The optimistic
+  bound already fails by >14 dB; a real kernel (e4m3 P, e4m3 cache) would be
+  worse. Probe reverted (no code left). Stop-condition honored (PSNR <45 every
+  variant → revert, per roadmap 4C).
+- Consequence for the roadmap trajectory: the FP8 lever (both GEMM and
+  attention) is closed at the ≥49 gate for this distilled model. The remaining
+  denoise-side headroom is structural/lossless (5A) or the deferred rope
+  interleave; the E2E ceiling is now decode-tail bound (%32 wall).
 
 ### Entry template (copy-paste per attempt)
 
