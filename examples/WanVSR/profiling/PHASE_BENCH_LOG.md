@@ -69,6 +69,11 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 4A | RoPE fp32 (fused apply) | `FLASHVSR_ROPE_FP32` (reverted) | — | — | ~0 (x1.01 isolated) | — | — | — | — | ≤1 bf16 ULP (numerically fine) | **drop** (no speedup — rope is interleave-access-bound at ~400 GB/s, not fp64-bound) |
 | 2026-07-08 | 4B | FP8 GEMM blockwise (`_scaled_mm_v2` 1x128 act + 1x128 weight) | `FLASHVSR_FP8_GEMM_MODE=blockwise` | — | — | isolated GEMM ×1.13–1.34 | — | — | — | +1.0 GiB | full-scope PSNR **41.00 dB** (ffn 42.71 / qkv,o,lq 43.51 / lq 49.49) | keep-behind-flag, **NOT enable-eligible** (only speed-neutral `lq` clears ≥49) |
 | 2026-07-08 | 4C | FP8 attention (e4m3 K/V) quality de-risk probe | `FLASHVSR_ATTN_FP8_PROBE` (reverted) | — | — | — | — | — | — | — | E2E PSNR **34.96 dB** (optimistic bound) | **drop** (gate unreachable — attention far more e4m3-sensitive than GEMMs; no kernel written) |
+| 2026-07-08 | 5-P1 | Coalesced RoPE kernel (u32 pairs + direct complex128 reads) | `FLASHVSR_ROPE_KERNEL=triton` | 46.383 | 47.780 | **+3.01%** | 118.84 ms | 113.72 ms | 15.62 GiB | 15.62 GiB | kernel bit-eq (triton==fused==eager, both shapes); E2E max\|diff\|=0 | keep (recommended) |
+| 2026-07-08 | 5-P2 | Incremental pooled-K cache (rolling mean mirror) | `FLASHVSR_POOLED_K_CACHE` | 47.780 | 47.858 | +0.16% | 113.72 ms | 113.08 ms | 15.62 GiB | 15.64 GiB | probe: batched mean bit-eq; E2E max\|diff\|=0 + repeat bit-eq | keep (recommended) |
+| 2026-07-08 | 5-P3 | Zero-copy V windowing (rank-4 TMA raster arena + raster out) | `FLASHVSR_ATTN_ZEROCOPY` | 47.858 | 48.268 | +0.86% | 113.08 ms | 112.24 ms | 15.64 GiB | 15.64 GiB | kernel zc-vs-std bit-eq (incl. ring offset); E2E max\|diff\|=0 + repeat bit-eq | keep (recommended, requires triton2) |
+| 2026-07-08 | 5-P4a | Decoder overlap on the P1-P3 stack | `FLASHVSR_DECODER_OVERLAP` | 48.268 | 49.237 | **+2.01%** | 112.24 ms | 164.88 ms (absorbs decode) | 15.64 GiB | 15.18 GiB | lossless (2B-1, unchanged code) | **promote** (production set; keep OFF for per-chunk attribution runs) |
+| 2026-07-08 | 5-P4b | cudnn.benchmark=True (decoder conv autotune) | (no code) | 48.12 | 48.08 | −0.1% (noise) | — | — | — | — | output bit-identical (same algos picked) | **drop** (heuristics already optimal) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -769,6 +774,63 @@ second confirming entry.
 - **Recommended-set delta (pending 2nd confirming entry):**
   `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1`.
 
+#### 2026-07-08 · Phase 5 (P1–P4) · lossless structural pack — session log
+
+Base 46.383 FPS / 118.84 ms (triton2+FUSED_CSR). All items bit-exact
+(max|diff|=0 gates incl. multi-chunk ring rotation + ON-repeat stability).
+Runs: `profiling/runs/phase5/`.
+
+- **P1 coalesced RoPE kernel** (`diffsynth/models/triton_rope.py`): the fused
+  torch.compile RoPE read `freqs.real/.imag` as stride-2 fp64 views (~484 GB/s,
+  143 µs/call). Hand Triton kernel moves bf16 pairs as packed u32 words and
+  reads the complex128 storage directly: 128→36 µs (×3.6; ×3.9 at the chunk0
+  shape). Bit-exactness required matching torch's fp64→fp32→bf16 double-round
+  cast chain (c10::BFloat16 is float-constructed); with it, triton==fused==
+  eager bitwise at both shapes. E2E +3.01%, −5.1 ms/chunk (isolated predicted
+  −5.5 ✓).
+- **P2 incremental pooled-K**: probe first — torch.mean(dim=1) is bitwise
+  independent of batch row count ((264,128,C) == 4×(66,128,C) slices) → GO.
+  Pool each kv window once (when appended), carry pooled rows in a rolling
+  buffer mirroring the cat/trim sequence; self-heals on any length mismatch.
+  +0.16%, −0.6 ms (part of the 1.6 ms reduce was already latency-hidden).
+- **P3 zero-copy V (5A-v1)**: V never feeds mask pooling, so V windowing is
+  pure layout work. `_VRasterArena` keeps V as raster (F,h,w,C) frames
+  (contiguous appends, no permute); the v2 kernel gains RASTER_V (rank-4 TMA
+  box [2,8,8,64] window gather, probe bit-exact incl. ring f0 offsets) and
+  RASTER_OUT (epilogue stores rows straight to raster token order → win_rev
+  eliminated). K/Q stay windowed (their pooled means feed the exact mask;
+  raster pooling would change reduction order — 2B-3 lesson). Fallback: on
+  any zc failure the raster live view is partitioned on the fly and the
+  standard ladder runs. +0.86%, −0.84 ms (of the −2.7 estimate: the removed
+  copies partially overlapped other work, and the scattered raster store is
+  slightly slower than the contiguous window store).
+- **P4a decoder overlap re-eval**: on the shorter denoise chunk the overlap
+  win grew to **+2.01%** (49.237 FPS, tail 543→124 ms, peak −0.46 GiB) —
+  meets the pre-registered ≥2% promote gate. Promoted to the production
+  recommended set; benchmarking note stands (with the flag ON the `[chunks]`
+  metric measures denoise+decode, so per-chunk attribution runs keep it OFF).
+- **P4b cudnn.benchmark**: −0.1% and output bit-identical → cuDNN's heuristic
+  algo choices were already optimal for the decoder's static shapes. Dropped.
+
+**Session result @768:** 46.383 → **48.268** FPS denoise-set (+4.1%), →
+**49.237** with overlap (+6.2%); steady 118.84 → **112.24 ms**. Peak
+15.62→15.64 GiB (+0.02 pooled-K buffers; overlap variant 15.18).
+**@1536:** 12.669 → **13.194** (+4.1%), → **13.435** with overlap.
+**Cumulative vs Step-0 (38.585 FPS):** +25.1% recommended / **+27.6%** with
+overlap; @1536 vs campaign start (11.01): **+22.0%** with overlap.
+**Recommended set (updated):** 2A flags + `FLASHVSR_ATTN_BACKEND=triton2` +
+`FLASHVSR_FUSED_CSR=1` + `FLASHVSR_ROPE_KERNEL=triton` +
+`FLASHVSR_POOLED_K_CACHE=1` + `FLASHVSR_ATTN_ZEROCOPY=1`
+(+ `FLASHVSR_DECODER_OVERLAP=1` for production throughput).
+Interpretation: the denoise side is now deep in diminishing-returns territory
+(attention at 95% of ideal-sparse, GEMMs at 82–85% SOL, FP8 closed by quality,
+rope at BW): P1 was the last mid-size lossless brick and it delivered exactly
+its isolated prediction; P2/P3 confirmed that the remaining copy/pool costs
+were already partially hidden. The E2E ceiling is decode-bound: the decode
+tail is untouched ~540 ms serialized (or ~34% co-executed under overlap) —
+further FPS needs decoder-side work (Phase 4D compile-fusion under the PSNR
+gate) or accepting the ~49–50 FPS plateau @768.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -831,6 +893,8 @@ second confirming entry.
 | 6 | + DECODER_OVERLAP (kept behind flag, not in default set) | 42.373 | 190.58 ms (denoise+decode) | 15.16 GiB | +9.82% FPS vs Step 0 / +1.71% vs Step 5 | 2B-1, lossless; steady-chunk metric absorbs decode when ON — later per-chunk benchmarking stays flag-OFF; decode tail 561→125 ms |
 | 7 | 2A set + ATTN_BACKEND=**triton2** (kept behind flag pending confirmation entry) | 45.466 | 122.06 ms | 15.62 GiB | +17.83% FPS vs Step 0 / +9.05% vs the 2A set | Phase 3 attention v2; PSNR 50.03 dB vs sparse (same class as `triton`'s ~49.7); composes with all 2A flags |
 | 8 | + FFMA-softmax (3.5-1a, in triton2) + **FUSED_CSR** | 46.383 | 118.84 ms | 15.62 GiB | +20.2% FPS vs Step 0 / +11.68% vs the 2A set | Phase 3.5 exact-math pack; both lossless-class (PSNR 50.08 / bit-eq CSR); @1536 +10.5% |
+| 9 | + ROPE_KERNEL=triton + POOLED_K_CACHE + ATTN_ZEROCOPY | 48.268 | 112.24 ms | 15.64 GiB | **+25.1%** FPS vs Step 0 | Phase 5 P1-P3, all bit-exact (max\|diff\|=0) |
+| 10 | + DECODER_OVERLAP (production set) | **49.237** | 164.88 ms (denoise+decode) | 15.18 GiB | **+27.6%** FPS vs Step 0 | P4a: overlap re-promoted at +2.01% on the shorter chunk; keep OFF for per-chunk attribution runs |
 
 ---
 
@@ -841,3 +905,4 @@ second confirming entry.
 | 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |
 | 2026-07-08 | 3 | 2A set + ATTN_BACKEND=triton2 (OFF ref same session: 11.472 / 503.22 ms / 48.39 GiB) | 12.436 | 449.24 ms | 48.39 GiB | Phase-3 attention v2 spot-check: +8.4% FPS, −53.98 ms/chunk, peak unchanged — the kernel win holds at scale (attention share scale-invariant, ANALYSIS §0). |
 | 2026-07-08 | 3.5 | 2A set + triton2 + FUSED_CSR (OFF ref same session: 11.461 / 503.38 ms) | 12.669 | 438.20 ms | 48.39 GiB | Phase-3.5 spot-check: +10.5% FPS, −65.2 ms/chunk vs OFF — FFMA-softmax + fused CSR hold/grow at scale. |
+| 2026-07-08 | 5 | + ROPE_KERNEL + POOLED_K_CACHE + ATTN_ZEROCOPY | 13.194 | 414.32 ms | 48.49 GiB | Phase-5 P1-P3 spot: +4.1% vs Phase-3.5 set. With +DECODER_OVERLAP: **13.435 FPS** / 46.82 GiB — campaign total @1536: 11.01 → 13.44 (**+22.0%**). |
