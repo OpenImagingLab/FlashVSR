@@ -55,6 +55,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-3 | Attention strided IO (no transposes) | `FLASHVSR_ATTN_STRIDED_IO` | 39.429 | 41.099 | +4.24% | 150.76 ms | 141.14 ms | 15.50 GiB | 15.50 GiB | kernel + E2E max\|diff\|=0 | keep-enabled |
 | 2026-07-08 | 2A-4 | mask_gen lean (kthvalue + no repeat + seqlens cache) | `FLASHVSR_MASKGEN_LEAN` | 41.099 | 41.477 | +0.92% | 141.14 ms | 139.00 ms | 15.50 GiB | 15.50 GiB | mask equality + E2E max\|diff\|=0 | keep-enabled |
 | 2026-07-08 | 2A-5 | LQ projector lean (pad fold + no clones) | `FLASHVSR_LQPROJ_LEAN` | 41.477 | 41.580 | +0.25% | 139.00 ms | 138.46 ms | 15.50 GiB | 15.62 GiB | E2E max\|diff\|=0 (after dropping sub-item b) | keep-enabled |
+| 2026-07-08 | 2A-6 | CUDA Graphs on steady chunk | (not implemented) | 41.580 | — | — | 138.46 ms | — | 15.62 GiB | — | n/a | postpone (go/no-go gate failed) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -221,6 +222,31 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   and im2col gather (29%) are untouched by design. Since 2A-5 recovered
   <2 ms, the roadmap gate keeps Phase 2B-4 (fused im2col-GEMM) on the table.
 
+#### 2026-07-08 11:40 · Phase 2A-6 · CUDA Graphs go/no-go gate → NO-GO (postpone)
+
+- Commit / patch: none (gate evaluation only, per roadmap §2A-6)
+- Nsight report path: `profiling/reports/p2a_stack_768/` (nsys minimal trace,
+  full 2A stack, steady window chunks 2–6; attribution-only, not headline FPS)
+- Gate input 1 — idle: corrected steady-chunk idle with the full 2A stack is
+  0.6–2.5% (avg ~1.8%, `analysis.md` busy/idle table) → below the ≥2% go
+  threshold; ceiling ≤ ~3 ms/chunk @768 and ~0 at higher resolutions.
+- Gate input 2 — capture safety: the steady body is NOT capture-stable
+  today: (a) the 2A-2 KV arena advances a Python-int slice offset every chunk
+  and compacts on a data-dependent schedule (a captured graph would freeze
+  both), (b) LQ conditioning slices a different video range per chunk,
+  (c) the 2A-1a freqs buffer is rewritten per chunk (solvable — update
+  outside the graph — but only relevant if (a)/(b) were solved). Fixing (a)
+  requires a true ring buffer with device-side index remapping — exactly the
+  "invasive changes" this experiment is instructed not to expand into.
+- Decision: postpone (documented no-go; do not implement in 2A)
+- Interpretation: after the 2A cleanup the chunk is even less launch-bound
+  than the 3.1% Phase-1 measurement, so the graphs ceiling shrank while its
+  implementation cost grew (arena offsets). Attribution cross-checks the
+  stack wins: kv_cat memcpy 3.4 → ~0.5 ms/chunk, rope 10.1 → ~7.4, mask_gen
+  7.4 → ~4.4, attn transposes gone, `_bsfa_tma_kernel_snd` unchanged at
+  2.03 ms/call. Revisit graphs only if Phase 2B/3 work makes the steady body
+  static (or if deployment shows CPU contention).
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -246,6 +272,27 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 
 ---
 
+## Phase 2A closure summary (2026-07-08)
+
+- All of 2A-1..2A-5 landed with flag + log entry + interpretation +
+  correctness result; 2A-6 evaluated and postponed via its go/no-go gate.
+- Kept enabled (recommended set): `FUSE_ROPE`, `KV_RINGBUF`,
+  `ATTN_STRIDED_IO`, `MASKGEN_LEAN`, `LQPROJ_LEAN`. Kept behind flag:
+  `CACHE_ROPE_FREQS` (FPS-neutral @768, lossless, graph-capture prereq).
+  Rejected during development: LQPROJ sub-item (b) (non-contiguous GEMM
+  output → 49.9 dB, fails the lossless gate).
+- Combined-stack parity: `test_phase2a_lossless.py ALL` → max|diff| == 0 vs
+  all-flags-OFF (no flag interactions).
+- Result @768x1408: 38.585 → 41.580 FPS (+7.8%), steady chunk 156.28 →
+  138.46 ms (−17.8 ms); roadmap ceiling for 2A was ~20–26 ms — the gap is the
+  traced-CPU rope_freqs share (rides under GPU work untraced) and the
+  deliberately-skipped deep fusions (2B-3 mask topk, 2B-4 im2col).
+- @1536x2560 spot-check recorded below; peak-mem cost of the arena documented.
+- Recommended next (Phase 2B): decoder overlap (2B-1) first — decode is still
+  a fully serialized 17–23% of E2E; then FP8 GEMM infra (2B-2, default-OFF),
+  fused mask top-k (2B-3), fused im2col (2B-4, still eligible since 2A-5
+  recovered <2 ms).
+
 ## Cumulative stack
 
 <!-- Update whenever a flag joins/leaves the recommended set.
@@ -266,4 +313,4 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 
 | Date | Phase closed | Enabled set | FPS @1536 | Steady chunk @1536 | Peak mem @1536 | Notes |
 |------|--------------|-------------|-----------|--------------------|----------------|-------|
-|      |              |             |           |                    |                |       |
+| 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |

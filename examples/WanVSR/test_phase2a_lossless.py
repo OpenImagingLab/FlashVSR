@@ -77,10 +77,15 @@ def psnr(a, b):
 
 
 def main():
-    names = [n for n in sys.argv[1:] if n in FLAGS]
+    args = sys.argv[1:]
+    if args == ["ALL"]:
+        names = ["ALL"]
+    else:
+        names = [n for n in args if n in FLAGS]
     if not names:
-        print(f"usage: {sys.argv[0]} FLAG [FLAG...]   FLAG in {list(FLAGS)}"); sys.exit(2)
-    missing = [n for n in names if not hasattr(FLAGS[n][0], FLAGS[n][1])]
+        print(f"usage: {sys.argv[0]} FLAG [FLAG...] | ALL   FLAG in {list(FLAGS)}"); sys.exit(2)
+    missing = [n for n in names if n != "ALL"
+               and not hasattr(FLAGS[n][0], FLAGS[n][1])]
     if missing:
         print(f"FAIL: module attribute not found for {missing}"); sys.exit(2)
 
@@ -103,8 +108,12 @@ def main():
     print(f"  baseline (all OFF): {dt_off:.3f}s  {out/dt_off:6.2f} FPS")
     ok = True
     for n in names:
-        mod, attr, gate = FLAGS[n]
-        set_all({n: True})
+        if n == "ALL":
+            gate = "bit"  # every 2A flag measured bit-identical individually
+            set_all({k: True for k in FLAGS})
+        else:
+            mod, attr, gate = FLAGS[n]
+            set_all({n: True})
         run(pipe, LQ, th, tw, F)  # warm any lazy compile/cache for this flag
         v_on, dt_on = run(pipe, LQ, th, tw, F)
         d = (v_off - v_on).abs()

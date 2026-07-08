@@ -191,7 +191,7 @@ python infer_flashvsr_v1.1_tiny_long_video.py
 
 FlashVSR ships a set of **opt-in** fast paths for NVIDIA Hopper GPUs (e.g. GH200, `sm_90`). They are controlled by environment variables and are **all OFF by default**: with no variables set, the output is **bit-for-bit identical** to the standard path and Ampere / A100 are unaffected. Each path is guarded to `sm_90` and silently falls back to the original kernel elsewhere or on any error.
 
-On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~38 FPS (about 2.3x)**.
+On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~41.6 FPS (about 2.4x)** with the full config below.
 
 | Env var | Values | Default | Effect |
 |---|---|---|---|
@@ -203,6 +203,13 @@ On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~38 FPS (a
 | `FLASHVSR_CONV3D_IM2COL_BUDGET_GB` | float | `2.0` | chunked im2col memory budget for the `gemm` backend |
 | `FLASHVSR_CACHE_MOD` | `0`, `1` | `0` | cache step-invariant modulation (bit-identical) |
 | `FLASHVSR_CACHE_MASK_BIAS` | `0`, `1` | `0` | cache the geometry-only attention bias (bit-identical) |
+| `FLASHVSR_FUSE_ROPE` | `0`, `1` | `0` | fused single-kernel RoPE apply, same fp64 math (bit-identical) |
+| `FLASHVSR_KV_RINGBUF` | `0`, `1` | `0` | preallocated KV-cache arena, removes the per-chunk KV concat (bit-identical; retains a little extra memory, see `FLASHVSR_KV_RINGBUF_SPARE`) |
+| `FLASHVSR_KV_RINGBUF_SPARE` | int | `2` | arena spare slots: higher = rarer compaction copies, more retained memory |
+| `FLASHVSR_ATTN_STRIDED_IO` | `0`, `1` | `0` | strided q/k/v/out for the `triton` backend — removes all attention-path transpose copies (bit-identical) |
+| `FLASHVSR_MASKGEN_LEAN` | `0`, `1` | `0` | mask-generation cleanup (kthvalue select, no repeat copy, cached seqlens) — exact same mask (bit-identical) |
+| `FLASHVSR_LQPROJ_LEAN` | `0`, `1` | `0` | LQ projector: single-materialization causal pad + no cache clones (bit-identical) |
+| `FLASHVSR_CACHE_ROPE_FREQS` | `0`, `1` | `0` | assemble RoPE freqs on-device in a cached buffer (bit-identical; useful when the CPU is loaded) |
 
 **Recommended full-speed config** (run from `examples/WanVSR`):
 
@@ -211,13 +218,21 @@ FLASHVSR_CONV3D_BACKEND=gemm \
 FLASHVSR_TCDECODER_CHANNELS_LAST=1 \
 FLASHVSR_FUSE_NORM=1 \
 FLASHVSR_ATTN_BACKEND=triton \
+FLASHVSR_CACHE_MOD=1 \
+FLASHVSR_CACHE_MASK_BIAS=1 \
+FLASHVSR_FUSE_ROPE=1 \
+FLASHVSR_KV_RINGBUF=1 \
+FLASHVSR_ATTN_STRIDED_IO=1 \
+FLASHVSR_MASKGEN_LEAN=1 \
+FLASHVSR_LQPROJ_LEAN=1 \
 python infer_flashvsr_v1.1_tiny.py
 ```
 
 > **Notes**
 > - The `triton` backend and the `gemm` conv3d require a Hopper GPU (`sm_90`); on other GPUs they fall back to the default path automatically.
-> - `channels_last`, `CACHE_MOD` and `CACHE_MASK_BIAS` are bit-identical (`max|diff| = 0`). `FUSE_NORM` and the `triton` backend are near-identical (~49-50 dB PSNR vs the default), not bit-exact, due to fp/accumulation order, so they are opt-in.
-> - Parity + speed for each path can be checked with the `examples/WanVSR/test_*.py` scripts.
+> - `channels_last`, `CACHE_MOD`, `CACHE_MASK_BIAS`, and the Phase-2A knobs (`FUSE_ROPE`, `KV_RINGBUF`, `ATTN_STRIDED_IO`, `MASKGEN_LEAN`, `LQPROJ_LEAN`, `CACHE_ROPE_FREQS`) are bit-identical vs the same config without them (`max|diff| = 0`, see `examples/WanVSR/profiling/PHASE_BENCH_LOG.md`). `FUSE_NORM` and the `triton` backend are near-identical (~49-50 dB PSNR vs the default), not bit-exact, due to fp/accumulation order, so they are opt-in.
+> - Parity + speed for each path can be checked with the `examples/WanVSR/test_*.py` scripts (`test_phase2a_lossless.py` covers the Phase-2A knobs).
+> - Phase-2A stack measured on GH200: 38.6 → 41.6 FPS @768x1408 (steady chunk 156 → 138 ms) and 11.0 → 11.5 FPS @1536x2560; `KV_RINGBUF` retains ~+3 GiB @768 (tunable via `FLASHVSR_KV_RINGBUF_SPARE`).
 
 ---
 
