@@ -48,6 +48,45 @@ from .base import BasePipeline
 # ---------------------------------------------------------------------------
 _CACHE_ROPE_FREQS = os.environ.get("FLASHVSR_CACHE_ROPE_FREQS", "0") != "0"
 
+# ---------------------------------------------------------------------------
+# Phase 2B-1: decoder overlap on a side CUDA stream (FLASHVSR_DECODER_OVERLAP,
+# default OFF).
+#
+# Baseline (flag OFF, unchanged): after the whole denoise chunk loop, all
+# per-chunk latents are concatenated and TCDecoder.decode_video runs ONCE, on
+# the main stream, as a fully serialized tail (Phase-1 profiling: 17-23% of
+# E2E wall time @768-1536, zero overlap with denoise).
+#
+# Overlap path (flag ON): TCDecoder (`utils/TCDecoder.py::TAEHV`) is already a
+# stateful, strictly-sequential streaming decoder (`self.mem[i]` MemBlocks
+# carry state timestep-to-timestep; `flashvsr_tiny_long.py` already decodes
+# this way, one chunk at a time). This lets us decode each chunk's latents as
+# soon as that chunk's denoise output is finalized, on a dedicated side
+# stream, while the main stream moves on to the next chunk's denoise -
+# without changing decoder math, chunk boundaries, or output order.
+#
+# This is a scheduling change only:
+#   - stream placement:      new `self._decoder_overlap_stream` side stream,
+#                             created lazily once per pipeline instance.
+#   - event sync:             one `ready` event per chunk (main -> decode
+#                             stream handoff) + one `done` event per chunk
+#                             (decode stream -> main stream, waited on once,
+#                             in a batch, right before final assembly).
+#   - buffering/ordering:     decoded chunks are written into a preallocated,
+#                             chunk-index-addressed list (`decoded_chunks`),
+#                             never appended in completion order, so the
+#                             final `torch.cat` reproduces the exact
+#                             serialized-path frame order.
+#   - lifetime:               see the inline comments at the enqueue site in
+#                             `__call__` for exactly which stream owns which
+#                             tensor and when it becomes safe to reuse.
+#
+# Correctness target: bit-identical vs the serialized path. Validated by
+# `profiling/test_decoder_overlap_lossless.py`. See PHASE_BENCH_LOG.md for
+# the benchmark entry (Phase 2B-1).
+# ---------------------------------------------------------------------------
+_DECODER_OVERLAP = os.environ.get("FLASHVSR_DECODER_OVERLAP", "0") != "0"
+
 
 def _rope_freqs_cached(dit, f, h, w, f_start, device):
     """Device-side cached assembly of the per-chunk RoPE freqs tensor.
@@ -426,6 +465,28 @@ class FlashVSRTinyPipeline(BasePipeline):
         _prof_start = int(os.environ.get("FLASHVSR_PROFILER_START_CHUNK", "-1"))
         _prof_stop = int(os.environ.get("FLASHVSR_PROFILER_STOP_CHUNK", "-1"))
 
+        # Phase 2B-1 decoder overlap: set up the side stream + preallocated,
+        # chunk-index-addressed result slots. Guarded so that with the flag
+        # OFF (default) this is a no-op and the loop below is byte-for-byte
+        # the original serialized path.
+        use_decoder_overlap = (
+            _DECODER_OVERLAP
+            and LQ_video is not None
+            and torch.device(self.device).type == "cuda"
+        )
+        if use_decoder_overlap:
+            main_stream = torch.cuda.current_stream()
+            # Lazily created once per pipeline instance and reused across
+            # calls; a fresh side stream every call would work too, but reuse
+            # avoids per-call stream-creation overhead and is safe because
+            # each call's first `wait_event` only ever waits on THIS call's
+            # ready event (streams have no memory of past waits).
+            if getattr(self, "_decoder_overlap_stream", None) is None:
+                self._decoder_overlap_stream = torch.cuda.Stream(device=self.device)
+            decode_stream = self._decoder_overlap_stream
+            decoded_chunks = [None] * process_total_num   # slot == chunk_idx
+            decode_done_events = [None] * process_total_num
+
         with torch.no_grad():
             for cur_process_idx in progress_bar_cmd(range(process_total_num)):
                 if _prof_start >= 0 and cur_process_idx == _prof_start:
@@ -493,17 +554,92 @@ class FlashVSRTinyPipeline(BasePipeline):
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
+
+                if use_decoder_overlap:
+                    # --- Phase 2B-1: enqueue this chunk's decode on the side stream ---
+                    #
+                    # Inputs finalized as of THIS point (nothing later in the
+                    # loop mutates them): `cur_latents` is this chunk's
+                    # denoise output (next iteration REBINDS the name to a new
+                    # tensor, never writes into this one in place); the LQ
+                    # conditioning window `LQ_video[:, :, LQ_pre_idx:LQ_cur_idx]`
+                    # is a read-only slice of the caller-owned LQ_video tensor
+                    # (LQ_pre_idx still holds this chunk's start here - it is
+                    # only advanced to LQ_cur_idx on the next line). `ready_evt`
+                    # marks that finalization point on the main stream.
+                    with nvtx_range(f"decode_enqueue{cur_process_idx}"):
+                        ready_evt = torch.cuda.Event()
+                        ready_evt.record(main_stream)
+                        with torch.cuda.stream(decode_stream):
+                            # Decode stream owns ALL TCDecoder state (weights,
+                            # the channels_last conversion done on first call,
+                            # and every `self.mem[i]` MemBlock buffer) from
+                            # here on; the main stream never touches it. Stream
+                            # FIFO ordering guarantees chunk N's decode (incl.
+                            # its in-place `mem[i].copy_(...)` updates) fully
+                            # completes before chunk N+1's decode call below is
+                            # even launched, so the sequence of MemBlock state
+                            # transitions seen by the decoder is identical to
+                            # the serialized one-call-at-the-end path.
+                            decode_stream.wait_event(ready_evt)
+                            dec = self.TCDecoder.decode_video(
+                                cur_latents.transpose(1, 2), parallel=False,
+                                show_progress_bar=False,
+                                cond=LQ_video[:, :, LQ_pre_idx:LQ_cur_idx, :, :],
+                            ).transpose(1, 2).mul_(2).sub_(1)
+                            done_evt = torch.cuda.Event()
+                            done_evt.record(decode_stream)
+                        # Allocator guard (defense in depth): program order
+                        # already ensures `cur_latents`'s storage is not
+                        # reused by the main stream until long after decode
+                        # reads it (it is only freed once this whole Python
+                        # object goes out of scope, and any later main-stream
+                        # allocation from that freed block is ordered after
+                        # this call's final `wait_event` below). `record_stream`
+                        # makes that safety explicit and independent of that
+                        # reasoning, at negligible cost.
+                        cur_latents.record_stream(decode_stream)
+                        decoded_chunks[cur_process_idx] = dec
+                        decode_done_events[cur_process_idx] = done_evt
+
                 LQ_pre_idx = LQ_cur_idx
                 nvtx_chunk.__exit__(None, None, None)
                 if _prof_stop >= 0 and cur_process_idx == _prof_stop - 1:
                     torch.cuda.synchronize()
                     torch.cuda.profiler.stop()
 
-            latents = torch.cat(latents_total, dim=2)
+            if use_decoder_overlap:
+                # Every chunk's decode was already enqueued on decode_stream
+                # as soon as its latents were ready; the main stream never
+                # waited on any of them inside the loop above (that's the
+                # overlap). Before final assembly, make the main stream wait
+                # on every decode-done event. `Stream.wait_event` is a
+                # GPU-side queue-to-queue wait (cheap to issue, non-blocking
+                # for the host) - it is NOT `torch.cuda.synchronize()`; it
+                # only delays enqueuing of the `cat` below until the
+                # corresponding decode work is actually done, and by now
+                # (after 7-8 chunks of ~138 ms denoise each) it already is
+                # for every chunk except possibly the last.
+                with nvtx_range("decode_wait"):
+                    for done_evt in decode_done_events:
+                        main_stream.wait_event(done_evt)
+                    for dec in decoded_chunks:
+                        # dec was produced on decode_stream; mark it used on
+                        # main_stream so its (decode-stream-pool) memory isn't
+                        # recycled while main_stream (cat below, then
+                        # color_fix) is still reading it.
+                        dec.record_stream(main_stream)
+                    # Assemble strictly in logical chunk order (list is
+                    # preallocated/index-addressed - never appended in
+                    # completion order), reproducing the exact serialized-path
+                    # frame ordering.
+                    frames = torch.cat(decoded_chunks, dim=2)
+            else:
+                latents = torch.cat(latents_total, dim=2)
 
-            # Decode
-            with nvtx_range("decode"):
-                frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+                # Decode
+                with nvtx_range("decode"):
+                    frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
 
             # 颜色校正（wavelet）
             try:

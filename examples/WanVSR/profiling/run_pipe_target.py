@@ -115,10 +115,21 @@ def main():
     print(f"[target] init {t_init:.1f}s  lq_build {t_lq:.1f}s (cached={lq_cached})")
 
     chunk_times = []
+    loop_end_wall = {}  # populated when the chunk-loop generator is exhausted
 
     def timed_bar(iterable):
         """tqdm replacement that records per-chunk wall time (no added syncs;
-        in steady state per-chunk wall == pipeline throughput per chunk)."""
+        in steady state per-chunk wall == pipeline throughput per chunk).
+
+        Also records the wall-clock timestamp at which the chunk loop is
+        exhausted (last denoise chunk yielded). Everything the pipeline does
+        after that point (decode + color-fix under the serialized Phase-2A
+        path, or the final decode-stream sync + assembly + color-fix under
+        Phase-2B-1 decoder overlap) is the "tail". Comparing tail duration
+        before/after FLASHVSR_DECODER_OVERLAP is the primary evidence that
+        decode was actually hidden behind denoise, independent of whatever
+        steady per-chunk denoise time does.
+        """
         def gen():
             prev = time.perf_counter()
             for it in iterable:
@@ -126,6 +137,7 @@ def main():
                 now = time.perf_counter()
                 chunk_times.append(now - prev)
                 prev = now
+            loop_end_wall["t"] = time.perf_counter()
         return gen()
 
     kwargs = dict(
@@ -151,11 +163,13 @@ def main():
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
+    loop_end_wall.clear()
     t0 = time.perf_counter()
     with torch.no_grad():
         frames = pipe(**kwargs)
     torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
+    t_end = time.perf_counter()
+    wall = t_end - t0
 
     fps = (F - 4) / wall
     peak = torch.cuda.max_memory_allocated() / 2**30
@@ -165,7 +179,14 @@ def main():
     steady_ct = ct[2:7] if len(ct) >= 7 else ct[1:]
     steady_ms = round(sum(steady_ct) / max(len(steady_ct), 1), 2)
     print(f"[chunks] per-chunk ms: {ct}  steady_avg_ms: {steady_ms}")
-    print(f"[result] {json.dumps(dict(W=W, H=H, F=F, wall_s=round(wall,3), fps=round(fps,3), peak_gib=round(peak,2), steady_chunk_ms=steady_ms))}")
+    # Decode/color-fix "tail": wall time after the chunk loop is exhausted
+    # (last denoise chunk yielded from timed_bar) until pipe() actually
+    # returns and the device is drained. Serialized path: full decode +
+    # color_fix. Decoder-overlap path: only the residual (last chunk's
+    # decode work not yet hidden) + final event sync + assembly + color_fix.
+    tail_ms = round((t_end - loop_end_wall["t"]) * 1e3, 1) if "t" in loop_end_wall else None
+    print(f"[tail] post-loop ms (decode+color_fix): {tail_ms}")
+    print(f"[result] {json.dumps(dict(W=W, H=H, F=F, wall_s=round(wall,3), fps=round(fps,3), peak_gib=round(peak,2), steady_chunk_ms=steady_ms, tail_ms=tail_ms))}")
 
     if save:
         out = frames.float().clamp(-1, 1).add(1).div(2).mul(255).byte()
