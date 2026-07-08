@@ -98,6 +98,25 @@ _FUSE_NORM = os.environ.get("FLASHVSR_FUSE_NORM", "0") != "0"
 _CACHE_MOD = os.environ.get("FLASHVSR_CACHE_MOD", "0") != "0"
 _CACHE_MASK_BIAS = os.environ.get("FLASHVSR_CACHE_MASK_BIAS", "0") != "0"
 
+# ---------------------------------------------------------------------------
+# Phase 2A-4: mask-generation allocation/sync cleanup (FLASHVSR_MASKGEN_LEAN,
+# default OFF). Exact-semantics only — the produced boolean mask is identical:
+#   (a) threshold via torch.kthvalue(n-k) instead of topk(k+1).values[:,-1]
+#       — the same order statistic (ties included), computed by one
+#       radix-select kernel without materializing the (rows, k+1) values +
+#       int64 indices tensors (topk here selects ~45% of 17k elements/row);
+#   (b) drop the no-op `.repeat(1,1,1,1)` copy of the boolean mask (B==1 is
+#       asserted in generate_draft_block_mask);
+#   (c) sparse backend only: cache the cu_seqlens_q/k + head_mask_type int32
+#       tensors keyed on (seqlen, seqlen_kv, heads, device) — their per-call
+#       `torch.tensor(..., device=...)` construction is a hidden H2D sync
+#       (ANALYSIS §3, sparse-backend idle).
+# ---------------------------------------------------------------------------
+_MASKGEN_LEAN = os.environ.get("FLASHVSR_MASKGEN_LEAN", "0") != "0"
+
+# (c): persistent per-shape int32 tensors for the block_sparse_attn call.
+_SPARSE_SEQLENS_CACHE = {}
+
 
 def _maybe_compile(fn):
     if not _FUSE_NORM:
@@ -372,13 +391,24 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     flat = attn_map.reshape(loop_num, -1)
     n = flat.shape[1]
     apply_topk = min(flat.shape[1]-1, topk)
-    thresholds = torch.topk(flat, k=apply_topk + 1, dim=1, largest=True).values[:, -1]
+    if _MASKGEN_LEAN:
+        # 2A-4(a): (apply_topk+1)-th largest == (n-apply_topk)-th smallest.
+        # Identical exact value (order statistic, ties and all); single
+        # radix-select kernel, no (rows, k+1) values/indices materialization.
+        thresholds = torch.kthvalue(flat, n - apply_topk, dim=1).values
+    else:
+        thresholds = torch.topk(flat, k=apply_topk + 1, dim=1, largest=True).values[:, -1]
     thresholds = thresholds.unsqueeze(1)
     mask_new = (flat > thresholds).reshape(loop_num, s1, s2)
     mask_new = rearrange(mask_new, '(h it) s1 s2 -> h (it s1) s2', it=seqlen)  # keep shape note
     # 修正：上行变量名统一
     # mask_new = rearrange(attn_map, 'h (it s1) s2 -> h (it s1) s2', it=seqlen) * 0 + mask_new
-    mask = mask_new.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    if _MASKGEN_LEAN and batch_size == 1:
+        # 2A-4(b): batch_size==1 (asserted above) -> repeat(1,1,1,1) is a
+        # full copy with no semantic effect; a view is enough.
+        mask = mask_new.unsqueeze(0)
+    else:
+        mask = mask_new.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     return mask
 
 
@@ -458,9 +488,21 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
             except Exception:
                 torch.cuda.empty_cache()  # fall back to sparse
 
-        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-        head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
+        if _MASKGEN_LEAN:
+            # 2A-4(c): these int32 tensors depend only on shapes; building
+            # them per call is a hidden H2D sync on the sparse path.
+            skey = (seqlen, seqlen_kv, num_heads, q.device.index)
+            ent = _SPARSE_SEQLENS_CACHE.get(skey)
+            if ent is None:
+                ent = (torch.tensor([0, seqlen], device=q.device, dtype=torch.int32),
+                       torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32),
+                       torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32))
+                _SPARSE_SEQLENS_CACHE[skey] = ent
+            cu_seqlens_q, cu_seqlens_k, head_mask_type = ent
+        else:
+            cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
+            head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
         streaming_info = None
         max_seqlen_q_ = seqlen
         max_seqlen_k_ = seqlen_kv

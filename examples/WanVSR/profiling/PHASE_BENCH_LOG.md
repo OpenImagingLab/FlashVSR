@@ -53,6 +53,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2A-1b | Fused RoPE apply | `FLASHVSR_FUSE_ROPE` | 38.585 | 39.023 | +1.14% | 156.28 ms | 153.62 ms | 12.60 GiB | 12.60 GiB | max\|diff\|=0 (bit-identical) | keep-enabled |
 | 2026-07-08 | 2A-2 | KV cache arena (no per-chunk cat) | `FLASHVSR_KV_RINGBUF` | 39.023 | 39.429 | +1.04% | 153.62 ms | 150.76 ms | 12.60 GiB | 15.50 GiB | max\|diff\|=0 over 9 chunks | keep-enabled |
 | 2026-07-08 | 2A-3 | Attention strided IO (no transposes) | `FLASHVSR_ATTN_STRIDED_IO` | 39.429 | 41.099 | +4.24% | 150.76 ms | 141.14 ms | 15.50 GiB | 15.50 GiB | kernel + E2E max\|diff\|=0 | keep-enabled |
+| 2026-07-08 | 2A-4 | mask_gen lean (kthvalue + no repeat + seqlens cache) | `FLASHVSR_MASKGEN_LEAN` | 41.099 | 41.477 | +0.92% | 141.14 ms | 139.00 ms | 15.50 GiB | 15.50 GiB | mask equality + E2E max\|diff\|=0 | keep-enabled |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -159,6 +160,36 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
   also strided (stride-general kernel), and any failure falls back to the
   contiguous triton path, not to the sparse backend.
 
+#### 2026-07-08 10:45 · Phase 2A-4 · mask_gen allocation / sync cleanup
+
+- Commit / patch: phase2a mask_gen lean
+- Files changed: `diffsynth/models/wan_video_dit.py`
+  (`generate_draft_block_mask`, `flash_attention` sparse branch)
+- Flag: `FLASHVSR_MASKGEN_LEAN` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1 ATTN_STRIDED_IO=1`) + flag under test
+- Exact benchmark command: §0.4 primary + kept set + `FLASHVSR_MASKGEN_LEAN=1`
+- Resolution / frames: 768x1408 / F=81
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.099 → 41.477 (+0.92%) — 3-run medians
+- Steady chunk before → after (Δ): 141.14 → 139.00 ms (−2.14 ms)
+- Peak mem before → after: 15.50 → 15.50 GiB
+- Correctness: threshold + boolean-mask exact equality vs topk on random /
+  heavy-tie / softmax-distributed inputs at the real shape; E2E
+  `test_phase2a_lossless.py MASKGEN_LEAN` → max|diff| == 0
+- Isolated: topk(k=7920 of 17424) 0.187 ms → kthvalue 0.076 ms per call
+  (30 calls/chunk); plus removal of the boolean-mask repeat copy; sparse
+  backend additionally gets persistent cu_seqlens/head_mask_type (hidden H2D
+  sync removed — benefits the sparse fallback path, not the triton bench)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: −2.1 ms banked (roadmap estimated −1–2 ms for the lean pass;
+  the kthvalue swap alone projected −3.3 ms isolated but part of the chain is
+  latency that overlaps with neighbouring small kernels). Mask semantics are
+  provably unchanged — same order statistic, ties behave identically, strict
+  `>` compare untouched. The remaining ~5 ms of the mask_gen chain needs the
+  fused top-k kernel (Phase 2B-3), not more hygiene.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -195,6 +226,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 1 | baseline + FUSE_ROPE | 39.023 | 153.62 ms | 12.6 GiB | +1.14% FPS / −2.66 ms | 2A-1b, lossless |
 | 2 | + KV_RINGBUF | 39.429 | 150.76 ms | 15.5 GiB | +2.19% FPS / −5.52 ms | 2A-2, lossless; +2.9 GiB arena slack |
 | 3 | + ATTN_STRIDED_IO | 41.099 | 141.14 ms | 15.5 GiB | +6.52% FPS / −15.14 ms | 2A-3, lossless |
+| 4 | + MASKGEN_LEAN | 41.477 | 139.00 ms | 15.5 GiB | +7.50% FPS / −17.28 ms | 2A-4, exact mask |
 
 ---
 
