@@ -128,8 +128,13 @@ if _V2_OK:
         dot_a: ttgl.constexpr = ttgl.DotOperandLayout(
             operand_index=0, parent=mma, k_width=2)
         q_half = q_smem.slice(row_off, HALF_M, dim=0)
-        m_i = ttgl.full([HALF_M], -float("inf"), ttgl.float32,
-                        ttgl.SliceLayout(1, mma))
+        # Track the running max in the ALREADY-SCALED (log2e) domain: ms = m*s.
+        # Since s>0, maximum(m_i, rowmax)*s == maximum(ms_i, rowmax*s), so this
+        # is algebraically identical but lets the exponent be a single FFMA
+        # (qk*s - ms) instead of a broadcast-sub-then-mul ((qk-m)*s, which the
+        # compiler cannot contract). 3.5-1a; gated cos>=0.9999 + PSNR>=49.
+        ms_i = ttgl.full([HALF_M], -float("inf"), ttgl.float32,
+                         ttgl.SliceLayout(1, mma))
         l_i = ttgl.zeros([HALF_M], ttgl.float32, ttgl.SliceLayout(1, mma))
         acc = ttgl.zeros([HALF_M, HEAD_DIM], ttgl.float32, mma)
         qk0 = ttgl.zeros([HALF_M, BLOCK_N], ttgl.float32, mma)
@@ -147,11 +152,11 @@ if _V2_OK:
                 use_acc=False, is_async=True)
             qk = _hop.warpgroup_mma_wait(0, deps=[qk_tok])
             _mb.arrive(k_empty.index(0), count=1)
-            m_ij = ttgl.maximum(m_i, ttgl.max(qk, 1))
-            p = ttgl.exp2((qk - ttgl.expand_dims(m_ij, 1)) * scale_log2e)
+            ms_ij = ttgl.maximum(ms_i, ttgl.max(qk, 1) * scale_log2e)
+            p = ttgl.exp2(qk * scale_log2e - ttgl.expand_dims(ms_ij, 1))
             l_i = ttgl.sum(p, 1)
             p_prev = ttgl.convert_layout(p.to(ttgl.bfloat16), dot_a)
-            m_i = m_ij
+            ms_i = ms_ij
         for j in range(1, cnt):
             buf = j % NBUF
             phase = (j // NBUF) & 1
@@ -166,15 +171,15 @@ if _V2_OK:
                                      is_async=True)
             qk, acc = _hop.warpgroup_mma_wait(1, deps=[qk_tok, acc])
             _mb.arrive(k_empty.index(buf), count=1)
-            m_ij = ttgl.maximum(m_i, ttgl.max(qk, 1))
-            p = ttgl.exp2((qk - ttgl.expand_dims(m_ij, 1)) * scale_log2e)
-            alpha = ttgl.exp2((m_i - m_ij) * scale_log2e)
+            ms_ij = ttgl.maximum(ms_i, ttgl.max(qk, 1) * scale_log2e)
+            p = ttgl.exp2(qk * scale_log2e - ttgl.expand_dims(ms_ij, 1))
+            alpha = ttgl.exp2(ms_i - ms_ij)
             l_i = l_i * alpha + ttgl.sum(p, 1)
             acc = _hop.warpgroup_mma_wait(0, deps=[acc])
             _mb.arrive(v_empty.index(pbuf), count=1)
             acc = acc * ttgl.expand_dims(alpha, 1)
             p_prev = ttgl.convert_layout(p.to(ttgl.bfloat16), dot_a)
-            m_i = m_ij
+            ms_i = ms_ij
         if cnt > 0:
             lbuf = (cnt - 1) % NBUF
             lphase = ((cnt - 1) // NBUF) & 1
