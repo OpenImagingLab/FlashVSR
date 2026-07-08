@@ -60,6 +60,12 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2B-2 | FP8 GEMM infra (e4m3 `_scaled_mm` + Triton rowwise quant) | `FLASHVSR_FP8_GEMM` | 41.704 | 42.986 | +3.07% | 137.98 ms | 132.96 ms | 15.62 GiB | 16.65 GiB | PSNR 40.70 dB (full scope; NOT lossless by design — Phase-4 gate) | keep-behind-flag (Phase-4 enable gate) |
 | 2026-07-08 | 2B-3 | Fused mask-gen threshold-select (Triton radix select+compare) | `FLASHVSR_FUSED_MASKGEN` (removed) | 42.00 | 41.84 | −0.4% (harness E2E) | — | — | 15.62 GiB | 15.62 GiB | mask + E2E max\|diff\|=0 (exact) | **revert** (bit-exact but performance-negative) |
 | 2026-07-08 | 3 | Warp-specialized block-sparse attention v2 (Gluon producer/consumer + pingpong) | `FLASHVSR_ATTN_BACKEND=triton2` | 41.692 | 45.466 | **+9.05%** | 137.96 ms | 122.06 ms | 15.62 GiB | 15.62 GiB | kernel cos ≥0.999995 vs block_sparse (all densities + degenerates); E2E PSNR 50.03 dB; repeats bit-identical; default paths max\|diff\|=0 | keep-behind-flag (ncu gate 3/4; residency 12 warps/SM WS vs ≥16 letter) |
+| 2026-07-08 | 3.5-1a | Attention v2 FFMA-form softmax (scaled-max domain) | (in `triton2`) | 45.466 | 46.112 | +1.42% | 122.06 ms | 119.92 ms | 15.62 GiB | 15.62 GiB | kernel cos 0.999996 all densities+degenerate; E2E PSNR 50.08 dB; repeat bit-identical | keep (in triton2) |
+| 2026-07-08 | 3.5-1b | alpha==1 bit-exact rescale skip | (experiment) | 46.112 | — | — | — | — | — | — | bit-exact but −7% isolated kernel | **drop** (branch+reduce > overlapped FMULs) |
+| 2026-07-08 | 3.5-1c | explicit pingpong named-barrier | (experiment) | 46.112 | — | — | — | — | — | — | n/a | **drop** (deadlock risk; already ~83% peak, HGMMA only 13.6%) |
+| 2026-07-08 | 3.5-2 | Fused CSR build (sort-free cumsum-scatter) | `FLASHVSR_FUSED_CSR` | 46.112 | 46.383 | +0.59% | 119.92 ms | 118.84 ms | 15.62 GiB | 15.62 GiB | idx[0:cnt]+cnt bit-eq vs argsort (all densities+degenerate); v2 output max\|diff\|=0 | keep-behind-flag (lossless; recommended-with-triton2) |
+| 2026-07-08 | 3.5-3 | Decoder overlap × v2 remeasure | `FLASHVSR_DECODER_OVERLAP` | 46.383 | 47.239 | +1.85% | 118.84 ms | 172.9 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | inherited lossless (2B-1, backend-orthogonal); tail 543→126 ms | keep-behind-flag (co-exec 31.7% vs 34.1%; v2 did NOT free the ceiling) |
+| 2026-07-08 | 3.5-4 | RoPE freqs device cache × v2 remeasure | `FLASHVSR_CACHE_ROPE_FREQS` | 46.383 | 46.429 | +0.10% (noise) | 118.84 ms | 118.40 ms | 15.62 GiB | 15.65 GiB | lossless (2A-1a) | keep-behind-flag (still FPS-neutral @768 under v2) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -580,7 +586,70 @@ stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
    rescale skip, and explicit pingpong ordering so softmax(WG-A) overlaps
    HGMMA(WG-B). Isolated 1.139 ms = 95% of the 1.085 ms ideal-sparse ceiling;
    perfect softmax/wgmma overlap floor ≈ 0.95–1.0 ms in-pipe. (3) FP8 attention (Phase 4) now
-  has a WS substrate to build on.
+   has a WS substrate to build on.
+
+#### 2026-07-08 · Phase 3.5 · Exact-math efficiency pack (kernel FFMA + fused CSR + overlap/rope remeasures)
+
+Base = commit 1b4d5c6 (triton2 + 2A stack). Clocks locked 1980 MHz. Same-session
+OFF (`triton`) reference (3-run median): **41.531 FPS / 138.94 ms / 15.62 GiB**.
+All runs `profiling/runs/phase3_1/`.
+
+- **3.5-0 log attribution fix** (commit): PC-sampling (335k) showed the kernel is
+  softmax-math (~59%) + wgmma-wait (~24%) bound, NOT TMA/ring-head; the aggregate
+  `long_sb=2.00` was a producer-park artifact. No perf change.
+
+- **3.5-1a FFMA-form softmax** (commit, in `triton2`): track the running max in
+  the pre-scaled (log2e) domain (`ms = m*s`) so the exponent becomes one FFMA
+  `qk*s - ms` instead of the non-contractable `(qk-m)*s`. Isolated kernel
+  1.155 → **1.047–1.087 ms** (−6% median, −9.4% best), in-pipe ncu **1260 → 1179 µs,
+  tensor SOL 66.2 → 71.1%** (barrier 0.71 → 0.87, still < 1.0). Correctness: kernel
+  cos 0.999996 across all densities + degenerate; E2E PSNR(sparse, triton2)
+  **50.08 dB**; triton2 repeat bit-identical. E2E 45.466 → **46.112 FPS** (+1.42%),
+  122.06 → 119.92 ms. ncu report `reports/ncu/phase3_1_bsfa_v2.ncu-rep`.
+- **3.5-1b alpha==1 rescale skip** (dropped): IEEE-exact (x*1.0≡x) but the
+  per-iteration full-reduce + branch cost **more** than the acc-rescale FMULs it
+  skips (those overlap the tensor pipe): isolated 1.047 → 1.126 ms. Reverted.
+- **3.5-1c explicit pingpong named-barrier** (dropped): primitives exist
+  (`inline_asm_elementwise`, `ttgl.barrier`) but the two consumer partitions are
+  separate warp_specialize regions — coordinating a hardware named barrier across
+  them is high deadlock-risk for <few% upside (already ~83% of sustained bf16
+  peak; HGMMA is only 13.6% of warp-time so issue-port collision pressure is low).
+  Revisit only if FP8 attention (4C) raises HGMMA pressure.
+
+- **3.5-2 fused CSR build** (commit, `FLASHVSR_FUSED_CSR`): the v2 kernel reads
+  only `idx[0:cnt]`, so a single-pass `tl.cumsum` scatter reproduces
+  `idx[0:cnt]` + `cnt` bit-identically without `torch.argsort` (radixSort
+  ~0.71 ms/chunk). Lossless: idx[0:cnt]+cnt bit-equal vs `_make_csr` on random/
+  degenerate/all-true/all-false + chunk0 shape; v2 output max|diff|=0 fused vs
+  argsort. E2E 46.112 → **46.383 FPS** (+0.59%), 119.92 → 118.84 ms (−1.08).
+  Default OFF; recommended-with-triton2 (lossless internal-to-v2 detail).
+
+- **3.5-3 decoder overlap × v2** (`FLASHVSR_DECODER_OVERLAP`, measure only):
+  on the triton2+FUSED_CSR base, overlap gives 46.383 → **47.239 FPS** (+1.85%),
+  decode tail 543 → 126 ms, peak −0.46 GiB. nsys (`reports/phase3_1_overlap_v2/`):
+  decode busy 511 ms, co-executed with denoise **162 ms = 31.7%** — vs 2B-1's
+  34.1%. **The v2 kernel did NOT free the co-execution ceiling** (it still holds
+  229 KB smem / 1 CTA per SM, so the decoder's cuDNN conv grids still time-share
+  the SMs). Overlap losslessness inherited from 2B-1 (code byte-identical,
+  backend-orthogonal). Decision unchanged: keep-behind-flag (also < the +2%
+  promote threshold, and it muddies the per-chunk metric).
+
+- **3.5-4 CACHE_ROPE_FREQS × v2** (measure only): 46.383 → 46.429 FPS (+0.10%,
+  noise) — the freqs-construction cost is still CPU-side wall that rides under the
+  (now shorter) GPU chunk untraced. Lossless; keep-behind-flag (unchanged 2A-1a).
+
+**Phase 3.5 result @768:** OFF(triton) 41.531 → recommended triton2+FUSED_CSR
+**46.383 FPS** (+11.68%), 138.94 → 118.84 ms (−20.1); +DECODER_OVERLAP 47.239
+(+13.7% vs OFF). Peak 15.62 GiB unchanged. **@1536 spot:** OFF 11.461 → ON
+12.669 (+10.5%, 503.4 → 438.2 ms) — win holds/grows at scale.
+Interpretation: 3.5-1a is the substantive win (the kernel was softmax-elementwise
+bound as the PC-sampling predicted; folding the exponent to FFMA lifted tensor
+SOL 66→71% and banked −2.1 ms/chunk); 3.5-2 is a clean lossless −1.1 ms;
+3.5-3/3.5-4 are confirmed modest and stay flag-gated (overlap's ceiling is
+smem-bound, not backend-bound — a real Phase-4/5 dependency: only freeing v2's
+229 KB smem would raise co-execution). Recommended-set delta for the campaign:
+promote `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1` after the
+second confirming entry.
 
 ### Entry template (copy-paste per attempt)
 
@@ -643,6 +712,7 @@ stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
 | 5 | + LQPROJ_LEAN | 41.580 | 138.46 ms | 15.62 GiB | +7.76% FPS / −17.82 ms | 2A-5, lossless |
 | 6 | + DECODER_OVERLAP (kept behind flag, not in default set) | 42.373 | 190.58 ms (denoise+decode) | 15.16 GiB | +9.82% FPS vs Step 0 / +1.71% vs Step 5 | 2B-1, lossless; steady-chunk metric absorbs decode when ON — later per-chunk benchmarking stays flag-OFF; decode tail 561→125 ms |
 | 7 | 2A set + ATTN_BACKEND=**triton2** (kept behind flag pending confirmation entry) | 45.466 | 122.06 ms | 15.62 GiB | +17.83% FPS vs Step 0 / +9.05% vs the 2A set | Phase 3 attention v2; PSNR 50.03 dB vs sparse (same class as `triton`'s ~49.7); composes with all 2A flags |
+| 8 | + FFMA-softmax (3.5-1a, in triton2) + **FUSED_CSR** | 46.383 | 118.84 ms | 15.62 GiB | +20.2% FPS vs Step 0 / +11.68% vs the 2A set | Phase 3.5 exact-math pack; both lossless-class (PSNR 50.08 / bit-eq CSR); @1536 +10.5% |
 
 ---
 
@@ -652,3 +722,4 @@ stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
 |------|--------------|-------------|-----------|--------------------|----------------|-------|
 | 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |
 | 2026-07-08 | 3 | 2A set + ATTN_BACKEND=triton2 (OFF ref same session: 11.472 / 503.22 ms / 48.39 GiB) | 12.436 | 449.24 ms | 48.39 GiB | Phase-3 attention v2 spot-check: +8.4% FPS, −53.98 ms/chunk, peak unchanged — the kernel win holds at scale (attention share scale-invariant, ANALYSIS §0). |
+| 2026-07-08 | 3.5 | 2A set + triton2 + FUSED_CSR (OFF ref same session: 11.461 / 503.38 ms) | 12.669 | 438.20 ms | 48.39 GiB | Phase-3.5 spot-check: +10.5% FPS, −65.2 ms/chunk vs OFF — FFMA-softmax + fused CSR hold/grow at scale. |
