@@ -46,13 +46,16 @@ import numpy as np
 # fused dense attention instead of the sparse kernel: faster and uses full
 # context. Below the threshold the sparse kernel wins, so we keep it.
 #
-# Knob: FLASHVSR_ATTN_BACKEND = sparse | triton | auto | dense
+# Knob: FLASHVSR_ATTN_BACKEND = sparse | triton | triton2 | auto | dense
 #   sparse -> always block_sparse (DEFAULT = original behaviour, no quality change)
 #   triton -> Hopper WGMMA block-sparse kernel: exact same mask, output matches
 #             block_sparse very closely (~49.7 dB PSNR end-to-end; the only
 #             difference is WGMMA vs HMMA accumulation order). ~1.2x faster than
 #             block_sparse at the kernel level (~+9% end-to-end). sm_90 only;
 #             silently falls back to block_sparse elsewhere / on error.
+#   triton2 -> Phase-3 warp-specialized (producer/consumer + pingpong) Gluon
+#             kernel: exact same mask/CSR, ~1.5x the v1 kernel at the steady
+#             shape. sm_90 only; falls back v2 -> v1 triton -> block_sparse.
 #   auto   -> density-adaptive: dense if density>=FLASHVSR_ATTN_DENSE_THRESH
 #   dense  -> always cuDNN fused dense
 # FLASHVSR_ATTN_DENSE_THRESH default 0.5 (the measured crossover point).
@@ -158,6 +161,23 @@ try:
     from .triton_block_sparse_attn import triton_block_sparse_attention_snd as _TRITON_BSA_SND
 except Exception:
     _TRITON_BSA_SND = None
+
+# ---------------------------------------------------------------------------
+# Phase 3: warp-specialized block-sparse attention v2
+# (FLASHVSR_ATTN_BACKEND=triton2, sm_90 + Gluon only).
+#
+# FA3-style producer/consumer rewrite of the block-sparse kernel: a TMA
+# producer warp group streams the CSR-selected K/V blocks into a ring buffer
+# while two 64-row consumer warpgroups pingpong softmax against WGMMA
+# (12 warps/SM vs v1's barrier-locked 8). Exact same boolean mask, same CSR,
+# same (S, n, d) glue interface as the strided-IO path. Fallback ladder on
+# ANY failure: v2 -> v1 triton (strided -> contiguous) -> block_sparse_attn.
+# ---------------------------------------------------------------------------
+try:
+    from .triton_block_sparse_attn_v2 import (
+        triton_block_sparse_attention_v2 as _TRITON_BSA_V2)
+except Exception:
+    _TRITON_BSA_V2 = None
 
 
 def _is_hopper_dev(device):
@@ -465,13 +485,21 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 torch.cuda.empty_cache()  # fall back to sparse
 
         # Triton WGMMA block-sparse backend (opt-in, Hopper-guarded, exact mask).
-        if _ATTN_BACKEND == "triton" and _is_hopper_dev(q.device) and _TRITON_BSA is not None:
+        if _ATTN_BACKEND in ("triton", "triton2") and _is_hopper_dev(q.device) and _TRITON_BSA is not None:
             try:
                 # block mask -> (H, Nqb, Nkvb) bool
                 bm = base_blockmask
                 if bm.dim() == 4:
                     bm = bm[0]
                 bm = bm.bool()
+                # Phase 3: warp-specialized v2 kernel. Falls back to the v1
+                # triton paths below on any error (then to block_sparse).
+                if _ATTN_BACKEND == "triton2" and _TRITON_BSA_V2 is not None:
+                    try:
+                        xh = _TRITON_BSA_V2(q, k, v, bm)    # (S, n, d)
+                        return xh.reshape(1, xh.shape[0], -1)
+                    except Exception:
+                        torch.cuda.empty_cache()  # fall back to v1 triton
                 # 2A-3: strided IO — q/k/v stay (S, n, d), output comes back
                 # (S, n, d); zero transpose/contiguous copies in the glue.
                 if _ATTN_STRIDED_IO and _TRITON_BSA_SND is not None:

@@ -59,6 +59,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.662 | 42.373 | +1.71% | 138.30 ms | 190.58 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | E2E max\|diff\|=0 (full+short clip, 3x repeats) | keep-behind-flag |
 | 2026-07-08 | 2B-2 | FP8 GEMM infra (e4m3 `_scaled_mm` + Triton rowwise quant) | `FLASHVSR_FP8_GEMM` | 41.704 | 42.986 | +3.07% | 137.98 ms | 132.96 ms | 15.62 GiB | 16.65 GiB | PSNR 40.70 dB (full scope; NOT lossless by design — Phase-4 gate) | keep-behind-flag (Phase-4 enable gate) |
 | 2026-07-08 | 2B-3 | Fused mask-gen threshold-select (Triton radix select+compare) | `FLASHVSR_FUSED_MASKGEN` (removed) | 42.00 | 41.84 | −0.4% (harness E2E) | — | — | 15.62 GiB | 15.62 GiB | mask + E2E max\|diff\|=0 (exact) | **revert** (bit-exact but performance-negative) |
+| 2026-07-08 | 3 | Warp-specialized block-sparse attention v2 (Gluon producer/consumer + pingpong) | `FLASHVSR_ATTN_BACKEND=triton2` | 41.692 | 45.466 | **+9.05%** | 137.96 ms | 122.06 ms | 15.62 GiB | 15.62 GiB | kernel cos ≥0.999995 vs block_sparse (all densities + degenerates); E2E PSNR 50.03 dB; repeats bit-identical; default paths max\|diff\|=0 | keep-behind-flag (ncu gate 3/4; residency 12 warps/SM WS vs ≥16 letter) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -444,6 +445,123 @@ FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
   mask changes under the Phase-4 E2E-neutral protocol. 2B-4 (fused
   im2col-GEMM) remains the only open 2B item.
 
+#### 2026-07-08 · Phase 3 · Step 2 — fresh 2A-stack baseline + kernel isolation (Phase-3 starting point)
+
+Re-measured at the Phase-3 working tree (parent 25811e3), full 2A recommended
+stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
+
+| Field | Value |
+|---|---|
+| Run 1 / 2 / 3 FPS (pre-change tree) | 42.115 / 42.048 / 41.830 |
+| **Median FPS** | **42.048** (matches 2B-1 baseline 41.759 within noise) |
+| Median steady chunk ms | 136.88 · peak 15.62 GiB |
+| ncu `_bsfa_tma_kernel_snd` (steady, in-pipe) | 1997.4 µs · SM/tensor SOL 40.7% · occ 12.5% = 1 CTA/SM (178 reg + 229.4 KB smem) · grid 792 = 6.0 waves · L2 92% · stalls barrier 2.36 / wait 1.01 / short_sb 0.55 · no-eligible 68.6% |
+| `bench_ceilings.py` H2 re-run | cuDNN dense 1.945 ms → ideal sparse 1.179 ms (ANALYSIS ref: 1.86 / 1.13) |
+| Shape correction (measured, was undocumented) | steady attention consumes the UNTRIMMED kv window: q 8448 × **kv 33792** (264 blocks) at mask density **0.42–0.45** — FLOP-identical to ANALYSIS's "kv 25344 @ 0.606" framing (~120 active kv blocks/row either way). True ideal-sparse at the real shape/density: dense(33792) 2.576 ms × 0.4213 = **1.085 ms**. |
+| Logs | `profiling/runs/phase3/step2_baseline_run{1..3}.log`, `profiling/reports/ncu/phase3_bsfa_before.{ncu-rep,csv}` |
+
+#### 2026-07-08 16:30 · Phase 3 · Warp-specialized block-sparse attention v2 (`triton2`)
+
+- Commit / patch: phase3 attention v2 (this commit; parent 25811e3)
+- Files changed: new `diffsynth/models/triton_block_sparse_attn_v2.py` (Gluon
+  kernel + wrapper), `diffsynth/models/wan_video_dit.py` (triton2 branch in
+  `flash_attention`, knob doc), new `examples/WanVSR/test_attention_v2.py`,
+  new `examples/WanVSR/profiling/bench_attn_v2.py` (+ captured real mask
+  `profiling/cache/attn_mask_768_steady.pt`)
+- Flag: `FLASHVSR_ATTN_BACKEND=triton2` (default backend remains `sparse`;
+  the recommended-set line keeps `triton` until this entry is independently
+  confirmed). Tuning knobs: `FLASHVSR_ATTN_V2_NBUF` (default 3, measured
+  best), `FLASHVSR_ATTN_V2_PROD_REGS` (default 40, measured best).
+- Design (kernel): FA3-style Gluon warp specialization on sm_90 —
+  1 TMA producer warp group (4 warps @ 40 regs via `worker_num_regs`
+  setmaxnreg reallocation) streams the CSR-selected K/V 128×128 tiles into an
+  NBUF=3-deep smem ring (mbarrier full/empty handshakes, 2×64-col TMA boxes
+  per tile, next-index software prefetch); 2 consumer warpgroups (4 warps
+  each) own 64-row halves of the q block ("pingpong": one WG's softmax
+  overlaps the other's WGMMA) and additionally defer each P·V wgmma by one
+  iteration (issue QK(j) before PV(j−1); in-order retirement lets
+  `wait(pendings=1)` complete QK while PV drains under the softmax).
+  Exact-mask preservation is structural: same `(H,Nqb,Nkvb)` boolean mask,
+  same `_make_csr` (stable argsort → ascending kv-block order), all-false
+  rows → l=0 → l_safe → zero rows. Softmax scale folded into the exponent
+  (matches block_sparse_attn's FA2 formulation; v1 pre-scaled q in bf16).
+- Fallback ladder: triton2 → v1 strided (`_bsfa_tma_kernel_snd`) → v1
+  contiguous → `block_sparse_attn`; any v2 import/compile/launch failure
+  falls through silently. Default `sparse`/`triton` code paths untouched.
+- Route notes (prototyped and rejected):
+  (a) `tl.range(warp_specialize=True)` one-liner on the v1 kernel — the
+  hopper autoWS pass accepted the annotation but did NOT partition
+  (num_warps stayed 8; 1.751 ms = no-op). (b) occupancy tuning for
+  2 CTA/SM (M64/N64/w4 variants) — all slower (1.83–3.32 ms); WGMMA at
+  M64 tiles + no WS loses more than residency gains. (c) BLOCK_N=64
+  2-CTA variant of v2 — needs two wgmma layouts with per-iteration
+  conversions; rejected (compile complexity, expected loss).
+- Isolated kernel (bench_attn_v2.py, real captured mask d=0.4213, locked
+  clocks): v1 kernel-only 1.753 ms → v2 **1.139 ms** (×1.54, 649 TF/s
+  sparse-effective, 95% of the 1.085 ms ideal-sparse ceiling); NBUF/PROD_REGS
+  sweep: {2,3}×{24,40,56} → 3/40 best.
+- ncu acceptance gate (in-pipe steady chunk, `phase3_bsfa_v2_after.ncu-rep`):
+
+| Metric | Gate | Before (`_bsfa_tma_kernel_snd`) | After (`_bsfa_v2_kernel`) | Verdict |
+|---|---|---|---|---|
+| duration @ reference shape | ≤ 1.3 ms | 1997.4 µs | **1260.5 µs** | PASS |
+| tensor pipe (SM SOL) | ≥ 60% elapsed | 40.7% | **66.2%** | PASS |
+| barrier stall /issue | < 1.0 | 2.36 | **0.71** | PASS |
+| residency | ≥2 CTA/SM or WS ≥16 warps/SM | 1 CTA/SM · 8 warps | 1 CTA/SM · **12 warps WS** (4+4 consumers + 4 producer) | PARTIAL (see interpretation) |
+| (info) no-eligible-warp cycles | — | 68.6% | 57.7% | — |
+| (info) stalls long_sb / wait | — | 0.55 / 1.01 | 2.00 / 1.32 | — |
+
+- E2E @768x1408 F=81 (untraced, 3-run medians, same tree, back-to-back):
+  OFF (`triton`) 41.692 FPS / 137.96 ms / 15.62 GiB → ON (`triton2`)
+  **45.466 FPS / 122.06 ms / 15.62 GiB** = **+9.05% FPS, −15.90 ms/chunk,
+  peak unchanged**. Logs `profiling/runs/phase3/e2e_{off,on}_run{1..3}.log`.
+- Quality/correctness: kernel cos vs `block_sparse_attn` ≥ 0.999995 at the
+  real shape across densities {real 0.42, 0.1, 0.3, 0.45, 0.9, all-true} +
+  degenerate all-false masks/rows/heads (all-false rows exactly zero) +
+  determinism (2 calls bit-identical); E2E `test_attention_v2.py`:
+  PSNR(sparse, triton2) = **50.03 dB** (gate ≥49, v1 reference ~49.7),
+  max|d| = 0.3135, triton2 ×2 repeats bit-identical (multi-chunk KV/cache
+  contract stable); `test_phase2a_lossless.py ALL` → max|diff| = 0
+  (default paths byte-identical).
+- nsys attribution (`profiling/reports/phase3_attn_v2/`): `_bsfa_v2_kernel`
+  n=240 (8 chunks × 30 blocks) fully replaces `_bsfa_tma_kernel_snd` (0
+  occurrences); steady chunks 137.96 → 122.06 ms untraced.
+- @1536x2560 spot-check (single runs): OFF 11.472 FPS / 503.22 ms /
+  48.39 GiB → ON **12.436 FPS / 449.24 ms / 48.39 GiB** (+8.4%,
+  −53.98 ms/chunk) — the win holds/grows at scale as predicted
+  (attention share is scale-invariant).
+- Nsight report paths:
+  `profiling/reports/ncu/phase3_bsfa_before.{ncu-rep,csv}`,
+  `profiling/reports/ncu/phase3_bsfa_v2_after.{ncu-rep,csv}`,
+  `profiling/reports/phase3_attn_v2/` (nsys).
+- Decision: **keep-behind-flag** (pre-registered tier: the ncu gate is 3/4 —
+  the residency letter asks ≥2 CTA/SM or ≥16 warps/SM and v2 runs 12
+  warps/SM WS at 1 CTA/SM). Presumptive recommended-set promotion
+  (`FLASHVSR_ATTN_BACKEND=triton2`) after one independent confirming entry,
+  per the two-entry promotion rule.
+- Interpretation: the kernel hit the acceptance window on every *binding*
+  metric — 1.26 ms in-pipe (target ≤1.3; 1.14 ms isolated = 95% of the
+  ideal-sparse ceiling), tensor-active 66.2% (target ≥60), barrier stalls
+  2.36 → 0.71 — confirming the Phase-1 diagnosis that the v1 kernel was
+  scheduling-bound, not math-bound. The residency sub-criterion was
+  deliberately not chased: every ≥16-warp/2-CTA configuration we could
+  construct measured slower (occ variants 1.83–3.32 ms; N=64 2-CTA needs
+  per-iteration layout conversions), i.e. 12-warp warp-specialization with
+  softmax/WGMMA pingpong is the empirically optimal structure here, and the
+  gate's intent (kill the no-eligible-warp starvation) is what the passing
+  metrics measure. E2E banks −15.9 of the −22.1 ms/chunk the kernel saves
+  (30 × 737 µs): the remainder is the H8 power-cap clawback — the v2 kernel
+  raises sustained tensor throughput, so DVFS sags clocks harder during the
+  attention window; efficiency survives, raw time partially rebounds.
+  @768 lands at 45.5 FPS (+9.1%) instead of the roadmap's 49–51 estimate for
+  the same reason. Follow-ups: (1) re-measure `FLASHVSR_DECODER_OVERLAP`
+  co-execution on top of triton2 (v2 still occupies 229 KB smem/SM, so the
+  34% co-execution ceiling probably persists — measure, don't assume);
+  (2) long_sb 2.00/wait 1.32 in v2 are now the top stalls (TMA-latency
+  bound at the ring head) — NBUF=4 needs BLOCK_N=64 smem or Q-in-regs to
+  fit, which is Phase-4-adjacent tuning; (3) FP8 attention (Phase 4) now
+  has a WS substrate to build on.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -504,6 +622,7 @@ FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
 | 4 | + MASKGEN_LEAN | 41.477 | 139.00 ms | 15.5 GiB | +7.50% FPS / −17.28 ms | 2A-4, exact mask |
 | 5 | + LQPROJ_LEAN | 41.580 | 138.46 ms | 15.62 GiB | +7.76% FPS / −17.82 ms | 2A-5, lossless |
 | 6 | + DECODER_OVERLAP (kept behind flag, not in default set) | 42.373 | 190.58 ms (denoise+decode) | 15.16 GiB | +9.82% FPS vs Step 0 / +1.71% vs Step 5 | 2B-1, lossless; steady-chunk metric absorbs decode when ON — later per-chunk benchmarking stays flag-OFF; decode tail 561→125 ms |
+| 7 | 2A set + ATTN_BACKEND=**triton2** (kept behind flag pending confirmation entry) | 45.466 | 122.06 ms | 15.62 GiB | +17.83% FPS vs Step 0 / +9.05% vs the 2A set | Phase 3 attention v2; PSNR 50.03 dB vs sparse (same class as `triton`'s ~49.7); composes with all 2A flags |
 
 ---
 
@@ -512,3 +631,4 @@ FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
 | Date | Phase closed | Enabled set | FPS @1536 | Steady chunk @1536 | Peak mem @1536 | Notes |
 |------|--------------|-------------|-----------|--------------------|----------------|-------|
 | 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |
+| 2026-07-08 | 3 | 2A set + ATTN_BACKEND=triton2 (OFF ref same session: 11.472 / 503.22 ms / 48.39 GiB) | 12.436 | 449.24 ms | 48.39 GiB | Phase-3 attention v2 spot-check: +8.4% FPS, −53.98 ms/chunk, peak unchanged — the kernel win holds at scale (attention share scale-invariant, ANALYSIS §0). |
