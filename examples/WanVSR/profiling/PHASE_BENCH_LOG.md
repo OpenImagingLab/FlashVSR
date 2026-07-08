@@ -29,16 +29,16 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 
 | Field | Value |
 |---|---|
-| Date/time | _(fill)_ |
-| Commit | _(fill)_ |
-| GPU clocks locked | _(y/n, `nvidia-smi -lgc 1980,1980`)_ |
+| Date/time | 2026-07-08 ~08:30 |
+| Commit | df94d94 (phase1 instrumentation committed on top of 613bf9f) |
+| GPU clocks locked | y (`nvidia-smi -lgc 1980,1980`) |
 | Resolution / frames | 768x1408 / F=81 |
-| Run 1 / Run 2 / Run 3 FPS | _(fill)_ / _(fill)_ / _(fill)_ |
-| **Median FPS (= Phase-2 baseline)** | _(fill)_ |
-| Median steady chunk ms | _(fill)_ |
-| Peak memory GiB | _(fill)_ |
+| Run 1 / Run 2 / Run 3 FPS | 38.585 / 38.525 / 38.594 |
+| **Median FPS (= Phase-2 baseline)** | **38.585** |
+| Median steady chunk ms | **156.28** (156.28 / 156.50 / 156.18) |
+| Peak memory GiB | 12.6 |
 | Reference (Phase-1 campaign, single run) | 38.55 FPS · 156.24 ms · 12.6 GiB |
-| Notes | _(dmon anomalies, background processes, etc.)_ |
+| Notes | GPU otherwise idle, no compute apps; logs: `profiling/runs/phase2a/step0_baseline_run{1..3}.log`. Matches Phase-1 reference within noise. |
 
 ---
 
@@ -49,7 +49,30 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 
 | Date | Phase | Optimization | Flag | FPS Before | FPS After | Delta | Steady Chunk Before | Steady Chunk After | Peak Mem Before | Peak Mem After | Correctness | Decision |
 |------|-------|--------------|------|------------|-----------|-------|---------------------|--------------------|-----------------|----------------|-------------|----------|
-|      |       |              |      |            |           |       |                     |                    |                 |                |             |          |
+| 2026-07-08 | 2A-1a | RoPE freqs device cache | `FLASHVSR_CACHE_ROPE_FREQS` | 38.585 | 38.592 | +0.02% | 156.28 ms | 156.30 ms | 12.60 GiB | 12.63 GiB | max\|diff\|=0 (bit-identical) | keep-behind-flag |
+
+#### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
+
+- Commit / patch: on top of df94d94 (committed as phase2a rope freqs cache)
+- Files changed: `diffsynth/pipelines/flashvsr_tiny.py` (+ new `test_phase2a_lossless.py` harness)
+- Flag: `FLASHVSR_CACHE_ROPE_FREQS` (default OFF)
+- Env vars used (full set): full-knob baseline + flag under test
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_CACHE_ROPE_FREQS=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: n)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 38.585 → 38.592 (+0.02%, noise) — 3-run medians
+- Steady chunk before → after (Δ): 156.28 → 156.30 ms (noise)
+- Peak mem before → after: 12.60 → 12.63 GiB (+30 MB: device freqs buffers f=6 and f=2)
+- Correctness: `test_phase2a_lossless.py CACHE_ROPE_FREQS` → max|diff| == 0 (PASS)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-behind-flag
+- Interpretation: the ~44 ms/chunk `rope_freqs` cost seen in *traced* runs is CPU
+  wall that rides entirely under the 156 ms GPU chunk in untraced runs, so
+  removing it does not move FPS @768 — consistent with the roadmap note that
+  this is "CPU-side headroom", not GPU time. The change is bit-identical and
+  removes per-chunk CPU tensor construction + an 8.6 MB H2D, which matters for
+  CPU-loaded deployments and is a precondition for CUDA-graph capture (2A-6),
+  so it stays available behind its flag rather than being reverted.
 
 ### Entry template (copy-paste per attempt)
 
@@ -83,7 +106,7 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 
 | Step | Enabled Optimizations | FPS | Steady Chunk Time | Peak Memory | Delta vs Phase-2 Baseline | Notes |
 |------|----------------------|-----|-------------------|-------------|---------------------------|-------|
-| 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | _(fill)_ | _(fill)_ | _(fill)_ | — | Step-0 fresh baseline |
+| 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | 38.585 | 156.28 ms | 12.6 GiB | — | Step-0 fresh baseline (2026-07-08, df94d94) |
 |   |                      |     |                   |             |                           |       |
 
 ---

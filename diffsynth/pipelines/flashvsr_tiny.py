@@ -20,6 +20,75 @@ from ..nvtx_utils import nvtx_range
 from .base import BasePipeline
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A-1a: lossless RoPE freqs cache (FLASHVSR_CACHE_ROPE_FREQS, default OFF).
+#
+# The eager path assembles the per-chunk RoPE freqs tensor on the CPU from
+# `dit.freqs` (three complex128 tables that live on the CPU) and then moves the
+# ~(f*h*w, 1, 64)-complex result to the GPU — every chunk. Profiling (ANALYSIS
+# §4 item 5) shows this as tens of ms of per-chunk CPU wall plus an ~8.6 MB H2D
+# copy @768x1408. The assembly is pure slice/expand/cat (no arithmetic), so
+# performing exactly the same copies on-device from device-resident base tables
+# is bit-identical.
+#
+# Cache layout (bounded memory; shape/dtype/device aware):
+#   dit._rope_base_dev : {device_str: (f_tab, h_tab, w_tab) on device}
+#       one-time H2D copy of the small per-axis freq tables.
+#   dit._rope_freqs_buf: {(f, h, w, device_str): entry}
+#       entry = {"buf":   (f*h*w, 1, D) complex buffer on device,
+#                "hw_done": bool,   # h/w columns written (invariant per key)
+#                "f_start": int}    # temporal offset currently in the f columns
+#
+# Cache key semantics: the assembled tensor depends only on (f, h, w, f_start,
+# device). The h/w columns are invariant for a given (f, h, w); only the f
+# columns depend on the chunk's temporal offset f_start (= 0 for chunk 0, else
+# 4 + 2*idx), so they are rewritten in place when f_start changes. The buffer
+# is consumed strictly inside the current chunk (rope_apply) and never retained
+# by any cache (pre_cache_k/v hold post-RoPE K/V), so in-place reuse is safe.
+# ---------------------------------------------------------------------------
+_CACHE_ROPE_FREQS = os.environ.get("FLASHVSR_CACHE_ROPE_FREQS", "0") != "0"
+
+
+def _rope_freqs_cached(dit, f, h, w, f_start, device):
+    """Device-side cached assembly of the per-chunk RoPE freqs tensor.
+
+    Bit-identical to the eager CPU path: identical source values, identical
+    layout; only copy operations (slice/expand/copy_), no arithmetic.
+    """
+    dev_key = str(device)
+    base_map = getattr(dit, "_rope_base_dev", None)
+    if base_map is None:
+        base_map = {}
+        dit._rope_base_dev = base_map
+    base = base_map.get(dev_key)
+    if base is None:
+        base = tuple(t.to(device) for t in dit.freqs)
+        base_map[dev_key] = base
+    f_tab, h_tab, w_tab = base
+    fd, hd, wd = f_tab.shape[1], h_tab.shape[1], w_tab.shape[1]
+
+    buf_map = getattr(dit, "_rope_freqs_buf", None)
+    if buf_map is None:
+        buf_map = {}
+        dit._rope_freqs_buf = buf_map
+    key = (f, h, w, dev_key)
+    ent = buf_map.get(key)
+    if ent is None:
+        buf = torch.empty(f * h * w, 1, fd + hd + wd, dtype=f_tab.dtype, device=device)
+        ent = {"buf": buf, "hw_done": False, "f_start": None}
+        buf_map[key] = ent
+    buf = ent["buf"]
+    v = buf.view(f, h, w, fd + hd + wd)
+    if not ent["hw_done"]:
+        v[..., fd:fd + hd].copy_(h_tab[:h].view(1, h, 1, hd).expand(f, h, w, hd))
+        v[..., fd + hd:].copy_(w_tab[:w].view(1, 1, w, wd).expand(f, h, w, wd))
+        ent["hw_done"] = True
+    if ent["f_start"] != f_start:
+        v[..., :fd].copy_(f_tab[f_start:f_start + f].view(f, 1, 1, fd).expand(f, h, w, fd))
+        ent["f_start"] = f_start
+    return buf
+
+
 # -----------------------------
 # 基础工具：ADAIN 所需的统计量（保留以备需要；管线默认用 wavelet）
 # -----------------------------
@@ -541,7 +610,11 @@ def model_fn_wan_video(
 
     # RoPE 位置（分段）
     with nvtx_range("rope_freqs"):
-        if cur_process_idx == 0:
+        if _CACHE_ROPE_FREQS:
+            # 2A-1a: on-device cached assembly (bit-identical, no CPU work/H2D).
+            f_start = 0 if cur_process_idx == 0 else 4 + cur_process_idx * 2
+            freqs = _rope_freqs_cached(dit, f, h, w, f_start, x.device)
+        elif cur_process_idx == 0:
             freqs = torch.cat([
                 dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
                 dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
