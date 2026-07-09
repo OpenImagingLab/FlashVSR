@@ -30,6 +30,14 @@ except Exception:  # standalone use without diffsynth on path
             return False
     _fp8g = _Fp8Disabled()
 
+try:
+    from diffsynth.perf_stats import record as _perf_record, record_error as _perf_error
+except Exception:
+    def _perf_record(name, count=1):  # noqa: ARG001
+        return None
+    def _perf_error(name, error):  # noqa: ARG001
+        return None
+
 
 CACHE_T = 2
 
@@ -50,6 +58,15 @@ CACHE_T = 2
 # ---------------------------------------------------------------------------
 
 _CONV3D_BACKEND = os.environ.get("FLASHVSR_CONV3D_BACKEND", "auto").lower()
+_CONV3D_PACKER = os.environ.get("FLASHVSR_CONV3D_PACKER", "eager").lower()
+_CONV3D_PACKER_FAILED = False
+try:
+    from .triton_lq_im2col import im2col3d as _triton_im2col3d
+except Exception:
+    try:
+        from utils.triton_lq_im2col import im2col3d as _triton_im2col3d
+    except Exception:
+        _triton_im2col3d = None
 
 # Phase 2: per-chunk im2col patch memory budget (GB). The full im2col patch
 # tensor for conv2 is ~9.5 GB at 1920x2560; we tile the output-H axis so the
@@ -76,6 +93,8 @@ _CONV3D_IM2COL_BUDGET_GB = float(
 # (a)+(c) are copies-only changes: gated on E2E max|diff| == 0 across a clip.
 # ---------------------------------------------------------------------------
 _LQPROJ_LEAN = os.environ.get("FLASHVSR_LQPROJ_LEAN", "0") != "0"
+_LQPROJ_LEAN_FAILED = False
+_CONV3D_GEMM_FAILED = False
 
 
 def _is_hopper(device):
@@ -93,17 +112,34 @@ def _im2col_gemm_rows(x, weight, bias, stride, h0, h1):
     Cout = weight.shape[0]
     kt, kh, kw = weight.shape[2], weight.shape[3], weight.shape[4]
     st, sh, sw = stride
-    # input rows feeding output rows [h0,h1): [h0*sh : (h1-1)*sh + kh)
-    xs = x[:, :, :, h0 * sh:(h1 - 1) * sh + kh, :]
-    patches = (
-        xs.unfold(2, kt, st)
-        .unfold(3, kh, sh)
-        .unfold(4, kw, sw)
-    )
-    To, Ho, Wo = patches.shape[2], patches.shape[3], patches.shape[4]
-    patches = patches.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
-        N * To * Ho * Wo, Cin * kt * kh * kw
-    )
+    global _CONV3D_PACKER_FAILED
+    Ho = h1 - h0
+    To = (T - kt) // st + 1
+    Wo = (W - kw) // sw + 1
+    if (_CONV3D_PACKER == "triton" and not _CONV3D_PACKER_FAILED
+            and _triton_im2col3d is not None):
+        try:
+            patches = _triton_im2col3d(
+                x, (kt, kh, kw), stride, h0, Ho)
+            _perf_record("conv3d_packer_triton")
+        except Exception as exc:
+            _CONV3D_PACKER_FAILED = True
+            _perf_error("conv3d_packer_triton", exc)
+            patches = None
+    else:
+        patches = None
+    if patches is None:
+        # input rows feeding [h0,h1): [h0*sh : (h1-1)*sh + kh)
+        xs = x[:, :, :, h0 * sh:(h1 - 1) * sh + kh, :]
+        patches = (
+            xs.unfold(2, kt, st)
+            .unfold(3, kh, sh)
+            .unfold(4, kw, sw)
+        )
+        patches = patches.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(
+            N * To * Ho * Wo, Cin * kt * kh * kw
+        )
+        _perf_record("conv3d_packer_eager")
     wmat = weight.reshape(Cout, Cin * kt * kh * kw).t()
     out = torch.addmm(bias, patches, wmat) if bias is not None else patches @ wmat
     return out.reshape(N, To, Ho, Wo, Cout).permute(0, 4, 1, 2, 3)
@@ -151,8 +187,6 @@ def _conv3d_gemm(x, weight, bias, stride, contig_out=True):
         h1 = min(h0 + rows, Ho)
         out[:, :, :, h0:h1, :] = _im2col_gemm_rows(x, weight, bias, stride, h0, h1)
     return out
-
-
 class RMS_norm(nn.Module):
 
     def __init__(self, dim, channel_first=True, images=True, bias=False):
@@ -236,13 +270,19 @@ class CausalConv3d(nn.Conv3d):
                             contig_out=True)
 
     def forward(self, x, cache_x=None):
+        global _LQPROJ_LEAN_FAILED, _CONV3D_GEMM_FAILED
         # 2A-5: lean path (persistent pad buffer, no cat+pad double copy).
         # Only where the GEMM backend would be used anyway; falls back to the
         # reference path on any error.
-        if _LQPROJ_LEAN and _CONV3D_BACKEND == "gemm" and _is_hopper(x.device):
+        if (_LQPROJ_LEAN and not _LQPROJ_LEAN_FAILED
+                and _CONV3D_BACKEND == "gemm" and _is_hopper(x.device)):
             try:
-                return self._forward_lean(x, cache_x)
-            except Exception:
+                out = self._forward_lean(x, cache_x)
+                _perf_record("conv3d_lean_gemm")
+                return out
+            except Exception as exc:
+                _LQPROJ_LEAN_FAILED = True
+                _perf_error("conv3d_lean", exc)
                 torch.cuda.empty_cache()
                 # fall through to the reference path
 
@@ -259,13 +299,19 @@ class CausalConv3d(nn.Conv3d):
         # Hopper im2col+GEMM backend (opt-in, guarded, with fallback). The
         # causal replicate-pad + streaming cache above is already applied; only
         # the core padding-free conv is rerouted to a tensor-core GEMM.
-        if _CONV3D_BACKEND == "gemm" and _is_hopper(x.device):
+        if (_CONV3D_BACKEND == "gemm" and not _CONV3D_GEMM_FAILED
+                and _is_hopper(x.device)):
             try:
-                return _conv3d_gemm(x, self.weight, self.bias, self.stride)
-            except Exception:
+                out = _conv3d_gemm(x, self.weight, self.bias, self.stride)
+                _perf_record("conv3d_gemm")
+                return out
+            except Exception as exc:
+                _CONV3D_GEMM_FAILED = True
+                _perf_error("conv3d_gemm", exc)
                 torch.cuda.empty_cache()
                 # fall through to the standard cuDNN path
 
+        _perf_record("conv3d_cudnn")
         return super().forward(x)
     
 class PixelShuffle3d(nn.Module):

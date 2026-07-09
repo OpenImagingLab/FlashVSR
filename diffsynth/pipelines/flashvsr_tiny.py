@@ -17,6 +17,7 @@ from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
 from ..nvtx_utils import nvtx_range
+from ..perf_stats import record as _perf_record, record_error as _perf_error
 from .base import BasePipeline
 
 
@@ -129,6 +130,12 @@ def _rope_freqs_cached(dit, f, h, w, f_start, device):
 #     serialized path by construction (never completion order).
 # ---------------------------------------------------------------------------
 _DECODER_OVERLAP = os.environ.get("FLASHVSR_DECODER_OVERLAP", "0") != "0"
+
+# Write each overlapped decoder chunk directly into its final temporal slice.
+# This removes the serialized post-wait torch.cat and skips stacking the three
+# causal warm-up frames that are trimmed from chunk 0. Copy-only, opt-in.
+_DECODER_DIRECT_OUTPUT = os.environ.get(
+    "FLASHVSR_TCDECODER_DIRECT_OUTPUT", "0") != "0"
 
 
 # -----------------------------
@@ -449,6 +456,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         latents = noise
 
         process_total_num = (num_frames - 1) // 8 - 2
+        if process_total_num < 1:
+            raise ValueError("FlashVSR Tiny requires at least 25 input frames")
         is_stream = True
 
         # 清理可能存在的 LQ_proj_in cache
@@ -466,6 +475,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         use_decoder_overlap = (
             _DECODER_OVERLAP and LQ_video is not None and LQ_video.is_cuda
         )
+        if _DECODER_OVERLAP and not use_decoder_overlap:
+            _perf_record("decoder_overlap_unavailable")
         if use_decoder_overlap:
             if getattr(self, "_decode_stream", None) is None:
                 # One side stream per pipeline instance, reused across calls
@@ -474,7 +485,27 @@ class FlashVSRTinyPipeline(BasePipeline):
             main_stream = torch.cuda.current_stream(LQ_video.device)
             # Slots indexed by chunk id -> assembly is always in logical chunk
             # order, regardless of decode completion order.
-            decoded_chunks = [None] * process_total_num
+            direct_decoder_output = _DECODER_DIRECT_OUTPUT
+            if direct_decoder_output:
+                # Chunk 0 yields 21 RGB frames after causal trim; every later
+                # two-latent chunk yields eight. For accepted 8n+5 inputs this
+                # deliberately matches the existing cat path, which ignores
+                # the final four input frames rather than returning unwritten
+                # output storage.
+                decoded_frame_count = 21 + 8 * (process_total_num - 1)
+                try:
+                    frames = torch.empty(
+                        (1, 3, decoded_frame_count, height, width),
+                        dtype=self.torch_dtype, device=LQ_video.device)
+                    frames.record_stream(self._decode_stream)
+                except Exception as exc:
+                    _perf_error("decoder_direct_output", exc)
+                    if os.environ.get("FLASHVSR_REQUIRE_FASTPATHS", "0") != "0":
+                        raise
+                    torch.cuda.empty_cache()
+                    direct_decoder_output = False
+            if not direct_decoder_output:
+                decoded_chunks = [None] * process_total_num
             decode_done_events = [None] * process_total_num
 
         # Profiling window (FLASHVSR_NVTX tooling): cudaProfilerStart at chunk
@@ -571,12 +602,30 @@ class FlashVSRTinyPipeline(BasePipeline):
                             # split per chunk (semantics identical to
                             # flashvsr_tiny_long.py); mul_/sub_ run on the
                             # decode stream and only touch decode-owned memory.
-                            dec = self.TCDecoder.decode_video(
-                                cur_latents.transpose(1, 2),
-                                parallel=False,
-                                show_progress_bar=False,
-                                cond=LQ_video[:, :, LQ_pre_idx:LQ_cur_idx, :, :],
-                            ).transpose(1, 2).mul_(2).sub_(1)
+                            if direct_decoder_output:
+                                frame_start = 0 if cur_process_idx == 0 \
+                                    else 21 + (cur_process_idx - 1) * 8
+                                frame_count = 21 if cur_process_idx == 0 else 8
+                                output = frames[:, :, frame_start:
+                                                frame_start + frame_count]
+                                output_ntchw = output.transpose(1, 2)
+                            else:
+                                output_ntchw = None
+                            try:
+                                dec = self.TCDecoder.decode_video(
+                                    cur_latents.transpose(1, 2),
+                                    parallel=False,
+                                    show_progress_bar=False,
+                                    cond=LQ_video[:, :, LQ_pre_idx:LQ_cur_idx, :, :],
+                                    out=output_ntchw,
+                                ).transpose(1, 2).mul_(2).sub_(1)
+                            except Exception as exc:
+                                if direct_decoder_output:
+                                    _perf_error("decoder_direct_output", exc)
+                                raise
+                            _perf_record("decoder_overlap_chunks")
+                            if direct_decoder_output:
+                                _perf_record("decoder_direct_output_chunks")
                         done_event = torch.cuda.Event()
                         done_event.record(self._decode_stream)
                     # Defense in depth: tell the caching allocator these
@@ -585,7 +634,8 @@ class FlashVSRTinyPipeline(BasePipeline):
                     # Python references above were ever dropped early.
                     cur_latents.record_stream(self._decode_stream)
                     LQ_video.record_stream(self._decode_stream)
-                    decoded_chunks[cur_process_idx] = dec
+                    if not direct_decoder_output:
+                        decoded_chunks[cur_process_idx] = dec
                     decode_done_events[cur_process_idx] = done_event
 
                 LQ_pre_idx = LQ_cur_idx
@@ -602,20 +652,23 @@ class FlashVSRTinyPipeline(BasePipeline):
                 with nvtx_range("decode_wait"):
                     for done_event in decode_done_events:
                         main_stream.wait_event(done_event)
-                    for dec in decoded_chunks:
-                        # Decode-stream allocations are read by the main-stream
-                        # cat below; event-guard their eventual free so the
-                        # decode pool is not reused before the cat completes.
-                        dec.record_stream(main_stream)
-                    # Assemble strictly in chunk-id order (== logical frame
-                    # order); values match the one-shot decode bit-for-bit.
-                    frames = torch.cat(decoded_chunks, dim=2)
+                    if direct_decoder_output:
+                        _perf_record("decoder_direct_output_complete")
+                    else:
+                        for dec in decoded_chunks:
+                            # Decode-stream allocations are read by the
+                            # main-stream cat below; event-guard their free.
+                            dec.record_stream(main_stream)
+                        # Assemble strictly in chunk-id order.
+                        frames = torch.cat(decoded_chunks, dim=2)
+                        _perf_record("decoder_final_cat")
             else:
                 latents = torch.cat(latents_total, dim=2)
 
                 # Decode
                 with nvtx_range("decode"):
                     frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+                    _perf_record("decoder_serialized_calls")
 
             # 颜色校正（wavelet）
             try:
@@ -628,8 +681,11 @@ class FlashVSRTinyPipeline(BasePipeline):
                             chunk_size=16,
                             method='adain'
                         )
-            except:
-                pass
+                    _perf_record("color_fix_success")
+            except Exception as exc:
+                _perf_error("color_fix", exc)
+                if os.environ.get("FLASHVSR_REQUIRE_FASTPATHS", "0") != "0":
+                    raise
 
         return frames[0]
 

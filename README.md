@@ -189,16 +189,22 @@ python infer_flashvsr_v1.1_tiny_long_video.py
 
 ### ⚡ Hopper Acceleration (optional, GH200 / sm_90)
 
-FlashVSR ships a set of **opt-in** fast paths for NVIDIA Hopper GPUs (e.g. GH200, `sm_90`). They are controlled by environment variables and are **all OFF by default**: with no variables set, the output is **bit-for-bit identical** to the standard path and Ampere / A100 are unaffected. Each path is guarded to `sm_90` and silently falls back to the original kernel elsewhere or on any error.
+FlashVSR ships a set of **opt-in** fast paths for NVIDIA Hopper GPUs (e.g. GH200, `sm_90`). They are controlled by environment variables and are **all OFF by default**: with no variables set, the output is **bit-for-bit identical** to the standard path and Ampere / A100 are unaffected. Recoverable kernel/setup failures fall back to the original path and are exposed through telemetry. Direct-output failures after stateful decoding begins fail closed because replaying mutated decoder state is unsafe.
 
-On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~41.6 FPS (about 2.4x)** with the full config below.
+On a GH200 at 768x1408, the current production stack reaches **57.26 FPS core
+E2E** for v1.1 Tiny (F=81): the bit-identical stack reaches 54.61 FPS
+(+10.9% over the 49.23 FPS Phase-5 baseline), and the quality-gated
+`TCDECODER_CUDNN_FUSED` path (55.4 dB PSNR vs the lossless stack, gate 49 dB)
+plus the Phase-7 stack (49.59 dB PSNR vs the prior production set, gate 49 dB)
+add the remaining gain.
 
 | Env var | Values | Default | Effect |
 |---|---|---|---|
 | `FLASHVSR_CONV3D_BACKEND` | `auto`, `gemm` | `auto` | `gemm` = im2col + WGMMA conv3d for the LQ projector (largest single win) |
 | `FLASHVSR_TCDECODER_CHANNELS_LAST` | `0`, `1` | `0` | NHWC TCDecoder (bit-identical) |
 | `FLASHVSR_FUSE_NORM` | `0`, `1` | `0` | fuse norm / modulate / gate via `torch.compile` |
-| `FLASHVSR_ATTN_BACKEND` | `sparse`, `triton`, `auto`, `dense` | `sparse` | `triton` = Hopper WGMMA block-sparse kernel (same mask) |
+| `FLASHVSR_DIT_ROW_FUSION` | `0`, `1` | `0` | Triton affine-free LayerNorm + AdaLN and residual-gate fusion — quality-gated |
+| `FLASHVSR_ATTN_BACKEND` | `sparse`, `triton`, `triton2`, `auto`, `dense` | `sparse` | `triton2` = warp-specialized Hopper block-sparse kernel (same mask) |
 | `FLASHVSR_ATTN_TMA` | `0`, `1` | `1` | TMA bulk loads (only used by the `triton` backend) |
 | `FLASHVSR_CONV3D_IM2COL_BUDGET_GB` | float | `2.0` | chunked im2col memory budget for the `gemm` backend |
 | `FLASHVSR_CACHE_MOD` | `0`, `1` | `0` | cache step-invariant modulation (bit-identical) |
@@ -208,8 +214,18 @@ On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~41.6 FPS 
 | `FLASHVSR_KV_RINGBUF_SPARE` | int | `2` | arena spare slots: higher = rarer compaction copies, more retained memory |
 | `FLASHVSR_ATTN_STRIDED_IO` | `0`, `1` | `0` | strided q/k/v/out for the `triton` backend — removes all attention-path transpose copies (bit-identical) |
 | `FLASHVSR_MASKGEN_LEAN` | `0`, `1` | `0` | mask-generation cleanup (kthvalue select, no repeat copy, cached seqlens) — exact same mask (bit-identical) |
+| `FLASHVSR_MASKGEN_THRESHOLD_CACHE` | `0`, `1` | `0` | reuse each DiT block's previous steady-chunk threshold — quality-gated |
 | `FLASHVSR_LQPROJ_LEAN` | `0`, `1` | `0` | LQ projector: single-materialization causal pad + no cache clones (bit-identical) |
 | `FLASHVSR_CACHE_ROPE_FREQS` | `0`, `1` | `0` | assemble RoPE freqs on-device in a cached buffer (bit-identical; useful when the CPU is loaded) |
+| `FLASHVSR_CONV3D_PACKER` | `eager`, `triton` | `eager` | exact Triton im2col packing; retains the existing `torch.addmm` numerics |
+| `FLASHVSR_TCDECODER_POINTER_STATE` | `0`, `1` | `0` | rotate recurrent-state tensor references instead of copying them |
+| `FLASHVSR_TCDECODER_DIRECT_OUTPUT` | `0`, `1` | `0` | write overlapped decoder chunks directly into the final output |
+| `FLASHVSR_TCDECODER_FUSE_POINTWISE` | `0`, `1` | `0` | exact BF16 MemBlock bias/ReLU/residual Triton fusion |
+| `FLASHVSR_TCDECODER_UPSAMPLE` | `0`, `1` | `0` | exact channels-last nearest-neighbor Triton kernel |
+| `FLASHVSR_TCDECODER_CONCAT` | `0`, `1` | `0` | exact channels-last recurrent concat Triton kernel |
+| `FLASHVSR_TCDECODER_TGROW_UP` | `0`, `1` | `0` | run the 1x1 TGrow conv at low resolution and fuse temporal unpack + nearest upsample into one Triton kernel (measured bit-identical E2E) |
+| `FLASHVSR_TCDECODER_CUDNN_FUSED` | `0`, `1` | `0` | cuDNN runtime-fused Conv+Bias(+Add)+ReLU decoder engines — **quality-gated** (~55 dB PSNR vs the lossless stack), not bit-exact |
+| `FLASHVSR_TCDECODER_SPLITK_CONV` | `0`, `1` | `0` | avoid recurrent MemBlock concat via split-weight cuDNN convs; requires `TCDECODER_CUDNN_FUSED=1`, quality-gated |
 
 **Recommended full-speed config** (run from `examples/WanVSR`):
 
@@ -217,22 +233,51 @@ On a GH200 at 768x1408 these take the v1.1 Tiny denoise from **~17 to ~41.6 FPS 
 FLASHVSR_CONV3D_BACKEND=gemm \
 FLASHVSR_TCDECODER_CHANNELS_LAST=1 \
 FLASHVSR_FUSE_NORM=1 \
-FLASHVSR_ATTN_BACKEND=triton \
+FLASHVSR_DIT_ROW_FUSION=1 \
+FLASHVSR_ATTN_BACKEND=triton2 \
 FLASHVSR_CACHE_MOD=1 \
 FLASHVSR_CACHE_MASK_BIAS=1 \
+FLASHVSR_CACHE_ROPE_FREQS=0 \
 FLASHVSR_FUSE_ROPE=1 \
 FLASHVSR_KV_RINGBUF=1 \
 FLASHVSR_ATTN_STRIDED_IO=1 \
 FLASHVSR_MASKGEN_LEAN=1 \
+FLASHVSR_MASKGEN_THRESHOLD_CACHE=1 \
 FLASHVSR_LQPROJ_LEAN=1 \
+FLASHVSR_FUSED_CSR=1 \
+FLASHVSR_ROPE_KERNEL=triton \
+FLASHVSR_POOLED_K_CACHE=1 \
+FLASHVSR_ATTN_ZEROCOPY=1 \
+FLASHVSR_DECODER_OVERLAP=1 \
+FLASHVSR_FP8_GEMM=0 \
+FLASHVSR_CONV3D_PACKER=triton \
+FLASHVSR_TCDECODER_POINTER_STATE=1 \
+FLASHVSR_TCDECODER_DIRECT_OUTPUT=1 \
+FLASHVSR_TCDECODER_FUSE_POINTWISE=1 \
+FLASHVSR_TCDECODER_UPSAMPLE=1 \
+FLASHVSR_TCDECODER_CONCAT=1 \
+FLASHVSR_TCDECODER_TGROW_UP=1 \
+FLASHVSR_TCDECODER_CUDNN_FUSED=1 \
+FLASHVSR_TCDECODER_SPLITK_CONV=1 \
 python infer_flashvsr_v1.1_tiny.py
 ```
 
+The same preset is available as:
+
+```bash
+./run_flashvsr_v1.1_tiny_gh200.sh
+```
+
 > **Notes**
-> - The `triton` backend and the `gemm` conv3d require a Hopper GPU (`sm_90`); on other GPUs they fall back to the default path automatically.
+> - The `triton`/`triton2` attention backends, Triton decoder/LQ kernels, and `gemm` Conv3D require a Hopper GPU (`sm_90`); unsupported paths fall back automatically.
+> - `TCDECODER_DIRECT_OUTPUT` requires `DECODER_OVERLAP=1`; decoder Triton paths and `TCDECODER_SPLITK_CONV` require `TCDECODER_CHANNELS_LAST=1`; split-K also requires `TCDECODER_CUDNN_FUSED=1`; and `CONV3D_PACKER=triton` requires `CONV3D_BACKEND=gemm`.
 > - `channels_last`, `CACHE_MOD`, `CACHE_MASK_BIAS`, and the Phase-2A knobs (`FUSE_ROPE`, `KV_RINGBUF`, `ATTN_STRIDED_IO`, `MASKGEN_LEAN`, `LQPROJ_LEAN`, `CACHE_ROPE_FREQS`) are bit-identical vs the same config without them (`max|diff| = 0`, see `examples/WanVSR/profiling/PHASE_BENCH_LOG.md`). `FUSE_NORM` and the `triton` backend are near-identical (~49-50 dB PSNR vs the default), not bit-exact, due to fp/accumulation order, so they are opt-in.
-> - Parity + speed for each path can be checked with the `examples/WanVSR/test_*.py` scripts (`test_phase2a_lossless.py` covers the Phase-2A knobs).
+> - Parity + speed for each path can be checked with the `examples/WanVSR/test_*.py` scripts (`test_phase2a_lossless.py` covers the Phase-2A knobs; `test_phase5_lossless.py` modes `phase6`/`tgrowup`/`cudnnfuse` cover the Phase-6/6b decoder knobs; `test_tcdecoder_tgrow_up.py` is the isolated TGROW_UP kernel test).
 > - Phase-2A stack measured on GH200: 38.6 → 41.6 FPS @768x1408 (steady chunk 156 → 138 ms) and 11.0 → 11.5 FPS @1536x2560; `KV_RINGBUF` retains ~+3 GiB @768 (tunable via `FLASHVSR_KV_RINGBUF_SPARE`).
+> - Phase-6 production stack measured on GH200: 49.23 → 53.42 FPS @768x1408 and 13.44 → 14.68 FPS @1536x2560. All Phase-6 output changes are bit-identical against the Phase-5 production stack, including the accepted `8n+5` frame-count edge case.
+> - Phase-6b: `TCDECODER_TGROW_UP` (bit-identical vs the Phase-6 stack, 53.40 → 54.61 FPS @768 3-run median; single-run spot-check 14.36 → 14.69 FPS @1536x2560 F=41, +2.30%) and `TCDECODER_CUDNN_FUSED` (quality-gated, not bit-exact: 54.58 → 55.91 FPS @768 3-run median; 14.69 → 15.07 FPS @1536 with TGROW_UP already on, +2.59%; E2E 55.4–55.8 dB PSNR vs the lossless stack, gate 49 dB). Disable `TCDECODER_CUDNN_FUSED` for a strictly `max|diff|=0` pipeline; `TCDECODER_TGROW_UP` stays on in that case.
+> - Phase-7: row-wise DiT fusion, steady-threshold reuse, and MemBlock split-K move the quality-gated production stack **55.91 → 57.26 FPS** @768x1408 F=81 (3-run medians, +2.41%). Combined E2E PSNR is 49.81 dB at F=29 and 49.59 dB at F=89 vs the preceding production stack (gate 49 dB). The @1536x2560 spot reached 15.42 FPS at F=41 with 49.95 dB at F=29.
+> - Use `FLASHVSR_REQUIRE_FASTPATHS=1` with `profiling/run_pipe_target.py` to fail the benchmark if any requested backend silently falls back.
 
 ---
 

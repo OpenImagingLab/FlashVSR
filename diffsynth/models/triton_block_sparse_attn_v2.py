@@ -38,6 +38,8 @@ import os
 
 import torch
 
+from ..perf_stats import record as _perf_record
+
 _V2_OK = False
 _V2_ERR = None
 try:
@@ -369,7 +371,12 @@ def _build_call(q, k, v, bm, sm_scale, BLOCK_M=128, BLOCK_N=None):
         # exact refinement: every 128-wide mask block is covered by
         # 128/BLOCK_N consecutive tiles inheriting the same mask bit
         bm = bm.repeat_interleave(128 // BLOCK_N, dim=2)
-    idx, cnt = _make_csr_fused(bm) if _FUSED_CSR else _make_csr(bm)
+    if _FUSED_CSR:
+        idx, cnt = _make_csr_fused(bm)
+        _perf_record("csr_fused")
+    else:
+        idx, cnt = _make_csr(bm)
+        _perf_record("csr_argsort")
     assert idx.stride(2) == 1  # producer walks the index list contiguously
     o = torch.empty_like(q)
     scale_log2e = float(sm_scale) * 1.4426950408889634
@@ -446,7 +453,12 @@ def triton_block_sparse_attention_v2_zc(q, k, v_buf, v_f0, hrast, wrast,
         sm_scale = 1.0 / math.sqrt(D)
     bm = block_mask[..., :Nqb, :Nkvb]
     assert bm.shape == (H, Nqb, Nkvb)
-    idx, cnt = _make_csr_fused(bm) if _FUSED_CSR else _make_csr(bm)
+    if _FUSED_CSR:
+        idx, cnt = _make_csr_fused(bm)
+        _perf_record("csr_fused")
+    else:
+        idx, cnt = _make_csr(bm)
+        _perf_record("csr_argsort")
     assert idx.stride(2) == 1
     o = torch.empty_like(q)                    # (Nq, H, D), RASTER token order
     scale_log2e = float(sm_scale) * 1.4426950408889634

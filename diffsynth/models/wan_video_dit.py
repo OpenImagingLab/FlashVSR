@@ -9,6 +9,7 @@ from typing import Tuple, Optional, List
 from einops import rearrange
 from .utils import hash_state_dict_keys
 from ..nvtx_utils import nvtx_range
+from ..perf_stats import record as _perf_record, record_error as _perf_error
 # Phase 2B-2: FP8 GEMM infrastructure (FLASHVSR_FP8_GEMM, default OFF).
 from . import fp8_gemm as _fp8g
 
@@ -68,6 +69,10 @@ import numpy as np
 # ---------------------------------------------------------------------------
 _ATTN_BACKEND = os.environ.get("FLASHVSR_ATTN_BACKEND", "sparse").lower()
 _ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
+_DENSE_FAILED = False
+_ATTN_V2_FAILED = False
+_ATTN_V1_STRIDED_FAILED = False
+_ATTN_V1_FAILED = False
 
 # ---------------------------------------------------------------------------
 # Norm / elementwise fusion (Phase 3-B).
@@ -85,6 +90,21 @@ _ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
 # Knob FLASHVSR_FUSE_NORM = 0 | 1 (default off; opt-in, parity-gated).
 # ---------------------------------------------------------------------------
 _FUSE_NORM = os.environ.get("FLASHVSR_FUSE_NORM", "0") != "0"
+
+# Phase 7-A: fuse the two affine-free LayerNorm -> AdaLN chains in every DiT
+# block. The gate kernel has the same row-broadcast contract. Both are optional
+# and fall back to the existing torch.compile path if a runtime shape is not
+# supported.
+_DIT_ROW_FUSION = os.environ.get("FLASHVSR_DIT_ROW_FUSION", "0") != "0"
+_DIT_ROW_FUSION_FAILED = False
+try:
+    from .triton_dit_rows import (
+        layer_norm_modulate_triton as _DIT_LN_MODULATE,
+        gated_residual_triton as _DIT_GATED_RESIDUAL,
+    )
+except Exception:
+    _DIT_LN_MODULATE = None
+    _DIT_GATED_RESIDUAL = None
 
 # ---------------------------------------------------------------------------
 # Lossless step-invariant caches (Phase B).
@@ -118,6 +138,13 @@ _CACHE_MASK_BIAS = os.environ.get("FLASHVSR_CACHE_MASK_BIAS", "0") != "0"
 #       (ANALYSIS §3, sparse-backend idle).
 # ---------------------------------------------------------------------------
 _MASKGEN_LEAN = os.environ.get("FLASHVSR_MASKGEN_LEAN", "0") != "0"
+
+# Phase 7-B prototype: the global order-statistic dominates mask generation
+# once the KV window has reached its steady shape. Reuse the previous chunk's
+# exact threshold per block and shape; the cache is reset at each new video.
+# This changes the selected mask, so it is quality-gated rather than lossless.
+_MASKGEN_THRESHOLD_CACHE = (
+    os.environ.get("FLASHVSR_MASKGEN_THRESHOLD_CACHE", "0") != "0")
 
 # ---------------------------------------------------------------------------
 # Phase 5-P2: incremental pooled-K cache (FLASHVSR_POOLED_K_CACHE, default
@@ -359,6 +386,7 @@ class _VRasterArena:
         f = x.shape[1]
         cap = self.buf.shape[0]
         if self.start + self.length + f > cap:
+            _perf_record("v_arena_compaction")
             with nvtx_range("kv_cat"):
                 if self.start < self.length:
                     tmp = self.buf[self.start:self.start + self.length].clone()
@@ -404,6 +432,7 @@ class _KVArena:
         cap = self.buf.shape[0]
         if self.start + self.length + n_new > cap:
             # Compact the live window to offset 0 (kv_cat residual, amortized).
+            _perf_record("kv_arena_compaction")
             with nvtx_range("kv_cat"):
                 if self.start < self.length:
                     # overlapping ranges: stage through a temp (copy_ on
@@ -448,8 +477,9 @@ def _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num):
 
 @torch.no_grad()
 def generate_draft_block_mask(batch_size, nheads, seqlen,
-                              q_w, k_w, topk=10, local_attn_mask=None,
-                              avgpool_k=None):
+                               q_w, k_w, topk=10, local_attn_mask=None,
+                               avgpool_k=None, cached_thresholds=None,
+                               return_thresholds=False):
     assert batch_size == 1, "Only batch_size=1 supported for now"
     assert local_attn_mask is not None, "local_attn_mask must be provided"
     avgpool_q = torch.mean(q_w, dim=1) 
@@ -488,14 +518,26 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     flat = attn_map.reshape(loop_num, -1)
     n = flat.shape[1]
     apply_topk = min(flat.shape[1]-1, topk)
-    if _MASKGEN_LEAN:
+    use_cached_thresholds = (
+        cached_thresholds is not None
+        and cached_thresholds.shape == (loop_num,)
+        and cached_thresholds.device == flat.device
+        and cached_thresholds.dtype == flat.dtype
+    )
+    if use_cached_thresholds:
+        threshold_values = cached_thresholds
+        _perf_record("mask_threshold_cached")
+    elif _MASKGEN_LEAN:
         # 2A-4(a): (apply_topk+1)-th largest == (n-apply_topk)-th smallest.
         # Identical exact value (order statistic, ties and all); single
         # radix-select kernel, no (rows, k+1) values/indices materialization.
-        thresholds = torch.kthvalue(flat, n - apply_topk, dim=1).values
+        threshold_values = torch.kthvalue(flat, n - apply_topk, dim=1).values
+        _perf_record("mask_threshold_kthvalue")
     else:
-        thresholds = torch.topk(flat, k=apply_topk + 1, dim=1, largest=True).values[:, -1]
-    thresholds = thresholds.unsqueeze(1)
+        threshold_values = torch.topk(
+            flat, k=apply_topk + 1, dim=1, largest=True).values[:, -1]
+        _perf_record("mask_threshold_topk")
+    thresholds = threshold_values.unsqueeze(1)
     mask_new = (flat > thresholds).reshape(loop_num, s1, s2)
     mask_new = rearrange(mask_new, '(h it) s1 s2 -> h (it s1) s2', it=seqlen)  # keep shape note
     # 修正：上行变量名统一
@@ -506,7 +548,7 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
         mask = mask_new.unsqueeze(0)
     else:
         mask = mask_new.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-    return mask
+    return (mask, threshold_values) if return_thresholds else mask
 
 
 @torch.no_grad()
@@ -528,6 +570,7 @@ def generate_causal_block_mask(batch_size, nheads, seqlen, local_num, window_siz
 # Attention kernels
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
+    global _DENSE_FAILED, _ATTN_V2_FAILED, _ATTN_V1_STRIDED_FAILED, _ATTN_V1_FAILED
     if attention_mask is not None:
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
@@ -547,7 +590,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 density = 1.0
             use_dense = density >= _ATTN_DENSE_THRESH
 
-        if use_dense:
+        if use_dense and not _DENSE_FAILED:
             try:
                 # (S, n, d) -> (1, n, S, d) for fused dense SDPA, then back.
                 qd = q.unsqueeze(0).transpose(1, 2)
@@ -555,8 +598,11 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 vd = v.unsqueeze(0).transpose(1, 2)
                 xd = _dense_sdpa((qd, kd, vd))             # (1, n, S, d)
                 x = xd.transpose(1, 2)                      # (1, S, n, d)
+                _perf_record("attn_dense")
                 return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-            except Exception:
+            except Exception as exc:
+                _DENSE_FAILED = True
+                _perf_error("attn_dense", exc)
                 torch.cuda.empty_cache()  # fall back to sparse
 
         # Triton WGMMA block-sparse backend (opt-in, Hopper-guarded, exact mask).
@@ -569,28 +615,41 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
                 bm = bm.bool()
                 # Phase 3: warp-specialized v2 kernel. Falls back to the v1
                 # triton paths below on any error (then to block_sparse).
-                if _ATTN_BACKEND == "triton2" and _TRITON_BSA_V2 is not None:
+                if (_ATTN_BACKEND == "triton2" and _TRITON_BSA_V2 is not None
+                        and not _ATTN_V2_FAILED):
                     try:
                         xh = _TRITON_BSA_V2(q, k, v, bm)    # (S, n, d)
+                        _perf_record("attn_v2")
                         return xh.reshape(1, xh.shape[0], -1)
-                    except Exception:
+                    except Exception as exc:
+                        _ATTN_V2_FAILED = True
+                        _perf_error("attn_v2", exc)
                         torch.cuda.empty_cache()  # fall back to v1 triton
                 # 2A-3: strided IO — q/k/v stay (S, n, d), output comes back
                 # (S, n, d); zero transpose/contiguous copies in the glue.
-                if _ATTN_STRIDED_IO and _TRITON_BSA_SND is not None:
+                if (_ATTN_STRIDED_IO and _TRITON_BSA_SND is not None
+                        and not _ATTN_V1_STRIDED_FAILED):
                     try:
                         xh = _TRITON_BSA_SND(q, k, v, bm)   # (S, n, d)
+                        _perf_record("attn_v1_strided")
                         return xh.reshape(1, xh.shape[0], -1)
-                    except Exception:
+                    except Exception as exc:
+                        _ATTN_V1_STRIDED_FAILED = True
+                        _perf_error("attn_v1_strided", exc)
                         torch.cuda.empty_cache()  # fall back to contiguous triton
                 # contiguous path: q/k/v (S,n,d) -> (n,S,d)
-                qh = q.transpose(0, 1).contiguous()
-                kh = k.transpose(0, 1).contiguous()
-                vh = v.transpose(0, 1).contiguous()
-                xh = _TRITON_BSA(qh, kh, vh, bm)            # (n, S, d)
-                x = xh.transpose(0, 1).contiguous().unsqueeze(0)  # (1, S, n, d)
-                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-            except Exception:
+                if not _ATTN_V1_FAILED:
+                    qh = q.transpose(0, 1).contiguous()
+                    kh = k.transpose(0, 1).contiguous()
+                    vh = v.transpose(0, 1).contiguous()
+                    xh = _TRITON_BSA(qh, kh, vh, bm)            # (n, S, d)
+                    x = xh.transpose(0, 1).contiguous().unsqueeze(0)  # (1, S, n, d)
+                    _perf_record("attn_v1_contiguous")
+                    return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            except Exception as exc:
+                if not _ATTN_V1_FAILED:
+                    _perf_error("attn_v1_contiguous", exc)
+                _ATTN_V1_FAILED = True
                 torch.cuda.empty_cache()  # fall back to sparse
 
         if _MASKGEN_LEAN:
@@ -626,6 +685,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
             exact_streaming=False,
             return_attn_probs=False,
         ).unsqueeze(0)
+        _perf_record("attn_sparse")
         x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
     elif compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -667,6 +727,20 @@ def _modulate_impl(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
 
 
 modulate = _maybe_compile(_modulate_impl)
+
+
+def layer_norm_modulate(x, norm, shift, scale, eps):
+    global _DIT_ROW_FUSION_FAILED
+    if (_DIT_ROW_FUSION and _DIT_LN_MODULATE is not None
+            and not _DIT_ROW_FUSION_FAILED):
+        try:
+            out = _DIT_LN_MODULATE(x, shift, scale, eps)
+            _perf_record("dit_row_ln_modulate")
+            return out
+        except Exception as exc:
+            _DIT_ROW_FUSION_FAILED = True
+            _perf_error("dit_row_ln_modulate", exc)
+    return modulate(norm(x), shift, scale)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -720,6 +794,8 @@ _FUSE_ROPE = os.environ.get("FLASHVSR_FUSE_ROPE", "0") != "0"
 # Fallback ladder: triton kernel -> fused (torch.compile) -> eager.
 # ---------------------------------------------------------------------------
 _ROPE_KERNEL = os.environ.get("FLASHVSR_ROPE_KERNEL", "").lower()
+_ROPE_TRITON_FAILED = False
+_ROPE_FUSED_FAILED = False
 try:
     from .triton_rope import rope_apply_triton as _ROPE_TRITON
 except Exception:
@@ -751,20 +827,29 @@ def _get_rope_fused():
 
 
 def rope_apply(x, freqs, num_heads):
-    if _ROPE_KERNEL == "triton" and _ROPE_TRITON is not None:
+    global _ROPE_TRITON_FAILED, _ROPE_FUSED_FAILED
+    if (_ROPE_KERNEL == "triton" and _ROPE_TRITON is not None
+            and not _ROPE_TRITON_FAILED):
         try:
-            return _ROPE_TRITON(x, freqs, num_heads)
-        except Exception:
-            pass  # fall back to fused / eager below
-    if _FUSE_ROPE:
+            out = _ROPE_TRITON(x, freqs, num_heads)
+            _perf_record("rope_triton")
+            return out
+        except Exception as exc:
+            _ROPE_TRITON_FAILED = True
+            _perf_error("rope_triton", exc)
+    if _FUSE_ROPE and not _ROPE_FUSED_FAILED:
         try:
-            return _get_rope_fused()(x, freqs.real, freqs.imag, num_heads)
-        except Exception:
-            pass  # fall back to the eager reference path below
+            out = _get_rope_fused()(x, freqs.real, freqs.imag, num_heads)
+            _perf_record("rope_fused")
+            return out
+        except Exception as exc:
+            _ROPE_FUSED_FAILED = True
+            _perf_error("rope_fused", exc)
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
+    _perf_record("rope_eager")
     return x_out.to(x.dtype)
 
 
@@ -827,6 +912,10 @@ class SelfAttention(nn.Module):
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
         B, L, D = x.shape
+        if is_stream and f == 6:
+            # A six-frame call begins a new video; never carry thresholds from
+            # its predecessor into the next stream.
+            self._mask_threshold_cache = None
         if is_stream and pre_cache_k is not None and pre_cache_v is not None:
             assert f==2, "f must be 2"
         if is_stream and (pre_cache_k is None or pre_cache_v is None):
@@ -943,30 +1032,47 @@ class SelfAttention(nn.Module):
                         and prev.shape[1] == k_w.shape[2]):
                     pooled_k = torch.cat(
                         [prev, torch.mean(k_w[old_rows:], dim=1)], dim=0)
+                    _perf_record("pooled_k_incremental")
                 else:  # fresh video / reset / mismatch -> re-pool everything
                     pooled_k = torch.mean(k_w, dim=1)
+                    _perf_record("pooled_k_rebuild")
                 # mirror cache_trim below: drop the oldest temporal slot when
                 # more than kv_len slots are cached
                 if (k_w.shape[0] // one_len) > kv_len:
                     self._pk_cache = pooled_k[one_len:]
                 else:
                     self._pk_cache = pooled_k
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask, avgpool_k=pooled_k)
+            if _MASKGEN_THRESHOLD_CACHE and B == 1 and is_stream:
+                attention_mask, thresholds = generate_draft_block_mask(
+                    B, self.num_heads, seqlen, q_w, k_w, topk=topk,
+                    local_attn_mask=self.local_attn_mask, avgpool_k=pooled_k,
+                    cached_thresholds=getattr(self, "_mask_threshold_cache", None),
+                    return_thresholds=True)
+                self._mask_threshold_cache = thresholds
+            else:
+                attention_mask = generate_draft_block_mask(
+                    B, self.num_heads, seqlen, q_w, k_w, topk=topk,
+                    local_attn_mask=self.local_attn_mask, avgpool_k=pooled_k)
 
         zc_done = False
         with nvtx_range("attn_core"):
             if use_zc:
-                try:
-                    bmb = attention_mask[0] if attention_mask.dim() == 4 else attention_mask
-                    hd = D // self.num_heads
-                    xh = _ZC_ATTN(
-                        reorder_q.view(-1, self.num_heads, hd),
-                        reorder_k.view(-1, self.num_heads, hd),
-                        varena.buf, varena.start, h, w, bmb.bool())
-                    x = xh.reshape(B, f * h * w, D)   # already RASTER order
-                    zc_done = True
-                except Exception:
-                    torch.cuda.empty_cache()
+                if not getattr(self, "_zc_failed", False):
+                    try:
+                        bmb = attention_mask[0] if attention_mask.dim() == 4 else attention_mask
+                        hd = D // self.num_heads
+                        xh = _ZC_ATTN(
+                            reorder_q.view(-1, self.num_heads, hd),
+                            reorder_k.view(-1, self.num_heads, hd),
+                            varena.buf, varena.start, h, w, bmb.bool())
+                        x = xh.reshape(B, f * h * w, D)   # already RASTER order
+                        zc_done = True
+                        _perf_record("attn_zc_v2")
+                    except Exception as exc:
+                        self._zc_failed = True
+                        _perf_error("attn_zc_v2", exc)
+                        torch.cuda.empty_cache()
+                if not zc_done:
                     # materialize windowed V from the raster arena and take the
                     # standard ladder (triton2 -> v1 triton -> block_sparse)
                     v_w = WindowPartition3D.partition(
@@ -1080,6 +1186,16 @@ class GateModule(nn.Module):
         super().__init__()
 
     def forward(self, x, gate, residual):
+        global _DIT_ROW_FUSION_FAILED
+        if (_DIT_ROW_FUSION and _DIT_GATED_RESIDUAL is not None
+                and not _DIT_ROW_FUSION_FAILED):
+            try:
+                out = _DIT_GATED_RESIDUAL(x, gate, residual)
+                _perf_record("dit_row_gate")
+                return out
+            except Exception as exc:
+                _DIT_ROW_FUSION_FAILED = True
+                _perf_error("dit_row_gate", exc)
         if _FUSE_NORM:
             return _gate_fused(x, gate, residual)
         return x + gate * residual
@@ -1091,6 +1207,7 @@ class DiTBlock(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
+        self.eps = eps
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(dim, num_heads, eps)
@@ -1121,7 +1238,7 @@ class DiTBlock(nn.Module):
             else:
                 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                     self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-            input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+            input_x = layer_norm_modulate(x, self.norm1, shift_msa, scale_msa, self.eps)
         with nvtx_range("self_attn"):
             self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
                 input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
@@ -1133,7 +1250,7 @@ class DiTBlock(nn.Module):
         with nvtx_range("xattn"):
             x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
         with nvtx_range("ffn"):
-            input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+            input_x = layer_norm_modulate(x, self.norm2, shift_mlp, scale_mlp, self.eps)
             if _fp8g.enabled("ffn"):
                 # 2B-2: e4m3 ffn1+ffn2; GELU is fused into ffn2's input
                 # quantization kernel (fp32 gelu -> e4m3).

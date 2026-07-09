@@ -33,7 +33,14 @@ import subprocess
 import sys
 from collections import defaultdict
 
-STEADY_CHUNKS = ["chunk2", "chunk3", "chunk4", "chunk5", "chunk6"]
+# True steady window for overlap mode: chunk2 still carries the decode-0/1
+# backlog, so the default steady set is chunks 3-7 (override via
+# FLASHVSR_ANALYZE_STEADY="chunk2,chunk3,..." for old-style windows).
+STEADY_CHUNKS = [
+    c.strip() for c in os.environ.get(
+        "FLASHVSR_ANALYZE_STEADY",
+        "chunk3,chunk4,chunk5,chunk6,chunk7").split(",") if c.strip()
+]
 
 LEAF_PHASES = [
     "lq_proj0", "lq_proj", "lq_conv1", "lq_conv2", "lq_linears",
@@ -45,6 +52,10 @@ LEAF_PHASES = [
 # parent ranges we also record for rollups
 PARENT_PHASES = ["dit_forward", "self_attn"]
 CHUNK_RE = re.compile(r"^chunk(\d+)$")
+# Overlap mode emits per-chunk decode ranges (decode0..decodeN); fold them all
+# into the single "decode" leaf phase so decoder-stream kernels stop showing
+# up as (unattributed).
+DECODE_RE = re.compile(r"^decode(\d+)$")
 
 KEY_METRICS = [
     "SMs Active [Throughput %]",
@@ -149,6 +160,8 @@ class Analyzer:
                 "SELECT start, end, text, textId, globalTid FROM NVTX_EVENTS "
                 "WHERE eventType = 59 AND end IS NOT NULL"):
             name = text if text else self.strings.get(text_id, "")
+            if DECODE_RE.match(name or ""):
+                name = "decode"
             self.nvtx.append((start, end, name, gtid))
         self.nvtx.sort()
 

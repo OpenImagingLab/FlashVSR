@@ -15,6 +15,12 @@ from collections import namedtuple
 from einops import rearrange
 import torch.nn.init as init
 
+try:
+    from diffsynth.perf_stats import record as _perf_record
+except Exception:
+    def _perf_record(name, count=1):  # noqa: ARG001
+        return None
+
 DecoderResult = namedtuple("DecoderResult", ("frame", "memory"))
 TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 
@@ -33,6 +39,70 @@ TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 
 _TCDEC_CHANNELS_LAST = os.environ.get("FLASHVSR_TCDECODER_CHANNELS_LAST", "0") != "0"
 
+# A MemBlock's recurrent state is its input tensor from the previous timestep.
+# Rebinding the state keeps that tensor alive and removes a full-frame D2D
+# copy after every non-initial MemBlock invocation. Arithmetic and state order
+# are unchanged. Opt-in until the E2E bit-equality/performance gate passes.
+_TCDEC_POINTER_STATE = os.environ.get(
+    "FLASHVSR_TCDECODER_POINTER_STATE", "0") != "0"
+
+_TCDEC_FUSE_POINTWISE = os.environ.get(
+    "FLASHVSR_TCDECODER_FUSE_POINTWISE", "0") != "0"
+_TCDEC_FUSE_POINTWISE_FAILED = False
+_TCDEC_UPSAMPLE = os.environ.get(
+    "FLASHVSR_TCDECODER_UPSAMPLE", "0") != "0"
+_TCDEC_UPSAMPLE_FAILED = False
+_TCDEC_CONCAT = os.environ.get(
+    "FLASHVSR_TCDECODER_CONCAT", "0") != "0"
+_TCDEC_CONCAT_FAILED = False
+# Algebraic reorder of the three `Upsample(2x) -> TGrow(1x1)` pairs: run the
+# bias-free 1x1 TGrow conv at LOW resolution (4x fewer FLOPs), then unpack the
+# temporal channel groups and nearest-upsample them in one Triton pass.
+# Nearest-neighbor duplication commutes exactly with a pointwise conv; the only
+# numeric caveat is that cuDNN may pick a different reduction split for the
+# low-res GEMM, so this path is gated on the >=49 dB PSNR budget (measured far
+# above; see PHASE_BENCH_LOG) rather than the bit-exact gate.
+_TCDEC_TGROW_UP = os.environ.get(
+    "FLASHVSR_TCDECODER_TGROW_UP", "0") != "0"
+_TCDEC_TGROW_UP_FAILED = False
+# cuDNN runtime-fused Conv+Bias(+Add)+ReLU for the MemBlock chain and the
+# standalone Conv->ReLU pairs. QUALITY-GATED (not bit-exact): the fused engine
+# skips the separate BF16 materialization between conv/bias/residual/ReLU, so
+# ~10-14% of values move by 1 BF16 ULP (~70 dB isolated PSNR, gate >= 49 dB).
+_TCDEC_CUDNN_FUSED = os.environ.get(
+    "FLASHVSR_TCDECODER_CUDNN_FUSED", "0") != "0"
+_TCDEC_CUDNN_FUSED_FAILED = False
+# Phase 7-C: the first MemBlock convolution consumes cat([current, past]).
+# Split its weights once and evaluate the two halves separately so the recurrent
+# concat allocation/copy disappears. cuDNN's add+ReLU path keeps the current
+# contribution fused with the second accumulation. This changes BF16 reduction
+# order, so it is quality-gated and only supplements CUDNN_FUSED.
+_TCDEC_SPLITK_CONV = os.environ.get(
+    "FLASHVSR_TCDECODER_SPLITK_CONV", "0") != "0"
+_TCDEC_SPLITK_CONV_FAILED = False
+try:
+    from .triton_tcdecoder_ops import (
+        bias_relu as _bias_relu,
+        bias_residual_relu as _bias_residual_relu,
+        upsample2x_channels_last as _upsample2x,
+        concat_channels_last as _concat_channels_last,
+        tgrow_upsample2x_channels_last as _tgrow_upsample2x,
+    )
+except Exception:
+    try:
+        from utils.triton_tcdecoder_ops import (
+            bias_relu as _bias_relu,
+            bias_residual_relu as _bias_residual_relu,
+            upsample2x_channels_last as _upsample2x,
+            concat_channels_last as _concat_channels_last,
+            tgrow_upsample2x_channels_last as _tgrow_upsample2x,
+        )
+    except Exception:
+        _bias_relu = None
+        _bias_residual_relu = None
+        _upsample2x = None
+        _concat_channels_last = None
+        _tgrow_upsample2x = None
 
 def _tcdec_channels_last_enabled(device=None):
     if not _TCDEC_CHANNELS_LAST:
@@ -74,7 +144,119 @@ class MemBlock(nn.Module):
         self.skip = nn.Conv2d(n_in, n_out, 1, bias=False) if n_in != n_out else nn.Identity()
         self.act = nn.ReLU(inplace=True)
     def forward(self, x, past):
-        return self.act(self.conv(torch.cat([x, past], 1)) + self.skip(x))
+        global _TCDEC_FUSE_POINTWISE_FAILED, _TCDEC_CONCAT_FAILED, \
+            _TCDEC_CUDNN_FUSED_FAILED, _TCDEC_SPLITK_CONV_FAILED
+        if (_TCDEC_SPLITK_CONV and _TCDEC_CUDNN_FUSED
+                and not _TCDEC_SPLITK_CONV_FAILED
+                and isinstance(self.skip, nn.Identity)):
+            # W * cat([x, past]) = W_current * x + W_past * past. Cache the
+            # two layout-contiguous views: slicing the input-channel dimension
+            # otherwise leaves a strided weight that defeats cuDNN's fast path.
+            try:
+                conv0, conv1, conv2 = self.conv[0], self.conv[2], self.conv[4]
+                channels = x.shape[1]
+                version = conv0.weight._version
+                cached = getattr(self, "_splitk_weights", None)
+                key = (conv0.weight.data_ptr(), version, channels)
+                if cached is None or cached[0] != key:
+                    current_weight = conv0.weight[:, :channels].contiguous(
+                        memory_format=torch.channels_last)
+                    past_weight = conv0.weight[:, channels:].contiguous(
+                        memory_format=torch.channels_last)
+                    self._splitk_weights = (key, current_weight, past_weight)
+                else:
+                    _, current_weight, past_weight = cached
+                past_y = F.conv2d(
+                    past, past_weight, None, conv0.stride, conv0.padding,
+                    conv0.dilation, conv0.groups)
+                y = torch.ops.aten.cudnn_convolution_add_relu(
+                    x, current_weight, past_y, 1.0, conv0.bias, conv0.stride,
+                    conv0.padding, conv0.dilation, conv0.groups)
+                y = torch.ops.aten.cudnn_convolution_relu(
+                    y, conv1.weight, conv1.bias, conv1.stride,
+                    conv1.padding, conv1.dilation, conv1.groups)
+                y = torch.ops.aten.cudnn_convolution_add_relu(
+                    y, conv2.weight, x, 1.0, conv2.bias, conv2.stride,
+                    conv2.padding, conv2.dilation, conv2.groups)
+                _perf_record("decoder_memblock_splitk")
+                return y
+            except Exception as exc:
+                _TCDEC_SPLITK_CONV_FAILED = True
+                try:
+                    from diffsynth.perf_stats import record_error
+                    record_error("decoder_memblock_splitk", exc)
+                except Exception:
+                    pass
+        if (_TCDEC_CONCAT and not _TCDEC_CONCAT_FAILED
+                and _concat_channels_last is not None):
+            try:
+                merged = _concat_channels_last(x, past)
+                _perf_record("decoder_concat_triton")
+            except Exception as exc:
+                _TCDEC_CONCAT_FAILED = True
+                try:
+                    from diffsynth.perf_stats import record_error
+                    record_error("decoder_concat_triton", exc)
+                except Exception:
+                    pass
+                merged = torch.cat([x, past], 1)
+                _perf_record("decoder_concat_native")
+        else:
+            merged = torch.cat([x, past], 1)
+            _perf_record("decoder_concat_native")
+        if (_TCDEC_CUDNN_FUSED and not _TCDEC_CUDNN_FUSED_FAILED
+                and isinstance(self.skip, nn.Identity)):
+            # Quality-gated cuDNN fused engines: conv+bias+ReLU twice, then
+            # conv+bias+residual+ReLU in a single kernel each. Removes the
+            # separate epilogue kernels entirely.
+            try:
+                conv0, conv1, conv2 = self.conv[0], self.conv[2], self.conv[4]
+                y = torch.ops.aten.cudnn_convolution_relu(
+                    merged, conv0.weight, conv0.bias, conv0.stride,
+                    conv0.padding, conv0.dilation, conv0.groups)
+                y = torch.ops.aten.cudnn_convolution_relu(
+                    y, conv1.weight, conv1.bias, conv1.stride,
+                    conv1.padding, conv1.dilation, conv1.groups)
+                y = torch.ops.aten.cudnn_convolution_add_relu(
+                    y, conv2.weight, x, 1.0, conv2.bias, conv2.stride,
+                    conv2.padding, conv2.dilation, conv2.groups)
+                _perf_record("decoder_memblock_cudnn")
+                return y
+            except Exception as exc:
+                _TCDEC_CUDNN_FUSED_FAILED = True
+                try:
+                    from diffsynth.perf_stats import record_error
+                    record_error("decoder_memblock_cudnn", exc)
+                except Exception:
+                    pass
+        if (_TCDEC_FUSE_POINTWISE and not _TCDEC_FUSE_POINTWISE_FAILED
+                and _bias_relu is not None and _bias_residual_relu is not None
+                and isinstance(self.skip, nn.Identity)):
+            try:
+                conv0, conv1, conv2 = self.conv[0], self.conv[2], self.conv[4]
+                y = F.conv2d(
+                    merged, conv0.weight, None, conv0.stride, conv0.padding,
+                    conv0.dilation, conv0.groups)
+                y = _bias_relu(y, conv0.bias)
+                y = F.conv2d(
+                    y, conv1.weight, None, conv1.stride, conv1.padding,
+                    conv1.dilation, conv1.groups)
+                y = _bias_relu(y, conv1.bias)
+                y = F.conv2d(
+                    y, conv2.weight, None, conv2.stride, conv2.padding,
+                    conv2.dilation, conv2.groups)
+                y = _bias_residual_relu(y, conv2.bias, x)
+                _perf_record("decoder_memblock_fused")
+                return y
+            except Exception as exc:
+                _TCDEC_FUSE_POINTWISE_FAILED = True
+                try:
+                    from diffsynth.perf_stats import record_error
+                    record_error("decoder_memblock_fused", exc)
+                except Exception:
+                    pass
+        _perf_record("decoder_memblock_native")
+        return self.act(self.conv(merged) + self.skip(x))
 
 class TPool(nn.Module):
     def __init__(self, n_f, stride):
@@ -93,6 +275,8 @@ class TGrow(nn.Module):
     def forward(self, x):
         _NT, C, H, W = x.shape
         x = self.conv(x)
+        if self.stride > 1:
+            _perf_record("decoder_tgrow_native")
         return x.reshape(-1, C, H, W)
 
 class PixelShuffle3d(nn.Module):
@@ -117,7 +301,8 @@ class PixelShuffle3d(nn.Module):
 # Generic NTCHW graph executor (kept; used by decoder)
 # ----------------------------
 
-def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
+def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None,
+                               output=None, output_trim=0):
     """
     Apply a sequential model with memblocks to the given input.
     Args:
@@ -129,6 +314,8 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
 
     Returns NTCHW tensor of output data.
     """
+    global _TCDEC_UPSAMPLE_FAILED, _TCDEC_TGROW_UP_FAILED, \
+        _TCDEC_CUDNN_FUSED_FAILED
     assert x.ndim == 5, f"TAEHV operates on NTCHW tensors, but got {x.ndim}-dim tensor"
     N, T, C, H, W = x.shape
     if parallel:
@@ -167,7 +354,12 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
                         mem[i] = xt
                     else:
                         xt_new = b(xt, mem[i])
-                        mem[i].copy_(xt)
+                        if _TCDEC_POINTER_STATE:
+                            mem[i] = xt
+                            _perf_record("decoder_state_pointer_updates")
+                        else:
+                            mem[i].copy_(xt)
+                            _perf_record("decoder_state_copies")
                     work_queue.insert(0, TWorkItem(xt_new, i+1))
                 elif isinstance(b, TPool):
                     if mem[i] is None:
@@ -183,13 +375,103 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
                 elif isinstance(b, TGrow):
                     xt = b(xt)
                     NT, C_, H_, W_ = xt.shape
-                    for xt_next in reversed(xt.view(N, b.stride*C_, H_, W_).chunk(b.stride, 1)):
+                    for xt_next in reversed(xt.view(
+                            N, b.stride * C_, H_, W_).chunk(b.stride, 1)):
                         work_queue.insert(0, TWorkItem(xt_next, i+1))
+                elif isinstance(b, nn.Upsample):
+                    fused_tgrow = False
+                    if (_TCDEC_TGROW_UP and not _TCDEC_TGROW_UP_FAILED
+                            and _tgrow_upsample2x is not None
+                            and b.scale_factor == 2.0
+                            and i + 1 < len(model)
+                            and isinstance(model[i + 1], TGrow)):
+                        # Reordered pair: 1x1 TGrow conv at LOW resolution,
+                        # then one kernel unpacks channel groups into temporal
+                        # frames and nearest-upsamples them. The Upsample node
+                        # at i and the TGrow node at i+1 are both consumed;
+                        # frames continue at layer i+2 in temporal order
+                        # (neither layer carries mem state).
+                        tgrow = model[i + 1]
+                        try:
+                            grown = F.conv2d(
+                                xt, tgrow.conv.weight, tgrow.conv.bias)
+                            frames = _tgrow_upsample2x(grown, tgrow.stride)
+                            _perf_record("decoder_tgrow_fused")
+                            for xt_next in reversed(
+                                    frames.chunk(tgrow.stride, 0)):
+                                work_queue.insert(
+                                    0, TWorkItem(xt_next, i + 2))
+                            fused_tgrow = True
+                        except Exception as exc:
+                            # Nothing observable mutated yet (xt and all mem
+                            # entries untouched) -> native path below replays
+                            # this Upsample node safely.
+                            _TCDEC_TGROW_UP_FAILED = True
+                            try:
+                                from diffsynth.perf_stats import record_error
+                                record_error("decoder_tgrow_fused", exc)
+                            except Exception:
+                                pass
+                    if not fused_tgrow:
+                        if (_TCDEC_UPSAMPLE and not _TCDEC_UPSAMPLE_FAILED
+                                and _upsample2x is not None
+                                and b.scale_factor == 2.0):
+                            try:
+                                xt = _upsample2x(xt)
+                                _perf_record("decoder_upsample_triton")
+                            except Exception as exc:
+                                _TCDEC_UPSAMPLE_FAILED = True
+                                try:
+                                    from diffsynth.perf_stats import record_error
+                                    record_error("decoder_upsample_triton", exc)
+                                except Exception:
+                                    pass
+                                xt = b(xt)
+                                _perf_record("decoder_upsample_native")
+                        else:
+                            xt = b(xt)
+                            _perf_record("decoder_upsample_native")
+                        work_queue.insert(0, TWorkItem(xt, i+1))
+                elif (isinstance(b, nn.Conv2d) and _TCDEC_CUDNN_FUSED
+                      and not _TCDEC_CUDNN_FUSED_FAILED
+                      and i + 1 < len(model)
+                      and isinstance(model[i + 1], nn.ReLU)):
+                    # Quality-gated fused Conv+Bias+ReLU pair (consumes the
+                    # ReLU node at i+1). Covers the latent-stage conv, the
+                    # deepening IdentityConv2d layers and the full-res tail.
+                    try:
+                        xt = torch.ops.aten.cudnn_convolution_relu(
+                            xt, b.weight, b.bias, b.stride, b.padding,
+                            b.dilation, b.groups)
+                        _perf_record("decoder_conv_relu_cudnn")
+                        work_queue.insert(0, TWorkItem(xt, i + 2))
+                    except Exception as exc:
+                        _TCDEC_CUDNN_FUSED_FAILED = True
+                        try:
+                            from diffsynth.perf_stats import record_error
+                            record_error("decoder_conv_relu_cudnn", exc)
+                        except Exception:
+                            pass
+                        xt = b(xt)
+                        work_queue.insert(0, TWorkItem(xt, i + 1))
                 else:
+                    if isinstance(b, nn.ReLU):
+                        _perf_record("decoder_relu_native")
                     xt = b(xt)
                     work_queue.insert(0, TWorkItem(xt, i+1))
         progress_bar.close()
-        x = torch.stack(out, 1)
+        if output is None:
+            x = torch.stack(out, 1)
+        else:
+            selected = out[output_trim:]
+            expected = (N, len(selected), selected[0].shape[1],
+                        selected[0].shape[2], selected[0].shape[3])
+            if tuple(output.shape) != expected:
+                raise ValueError(
+                    f"TCDecoder output shape mismatch: expected {expected}, "
+                    f"got {tuple(output.shape)}")
+            torch.stack(selected, 1, out=output)
+            x = output
     return x, mem
 
 # ----------------------------
@@ -292,19 +574,25 @@ class TAEHV(nn.Module):
             self.decoder.to(memory_format=torch.channels_last)
         self._cl_done = True
 
-    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
+    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None,
+                     out=None):
         """Decode a sequence of frames from latents.
         x: NTCHW latent tensor; returns NTCHW RGB in ~[0, 1].
         """
+        if out is not None and parallel:
+            raise ValueError("TCDecoder out requires parallel=False")
         self._maybe_to_channels_last()
         trim_flag = self.mem[-8] is None  # keeps original relative check
 
         if cond is not None:
             x = torch.cat([self.pixel_shuffle(cond), x], dim=2)
 
-        x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem)
+        trim = self.frames_to_trim if trim_flag else 0
+        x, self.mem = apply_model_with_memblocks(
+            self.decoder, x, parallel, show_progress_bar, mem=self.mem,
+            output=out, output_trim=trim if out is not None else 0)
 
-        if trim_flag:
+        if trim_flag and out is None:
             return x[:, self.frames_to_trim:]
         return x
 

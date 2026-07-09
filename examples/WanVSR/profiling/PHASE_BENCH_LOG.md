@@ -74,6 +74,15 @@ FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
 | 2026-07-08 | 5-P3 | Zero-copy V windowing (rank-4 TMA raster arena + raster out) | `FLASHVSR_ATTN_ZEROCOPY` | 47.858 | 48.268 | +0.86% | 113.08 ms | 112.24 ms | 15.64 GiB | 15.64 GiB | kernel zc-vs-std bit-eq (incl. ring offset); E2E max\|diff\|=0 + repeat bit-eq | keep (recommended, requires triton2) |
 | 2026-07-08 | 5-P4a | Decoder overlap on the P1-P3 stack | `FLASHVSR_DECODER_OVERLAP` | 48.268 | 49.237 | **+2.01%** | 112.24 ms | 164.88 ms (absorbs decode) | 15.64 GiB | 15.18 GiB | lossless (2B-1, unchanged code) | **promote** (production set; keep OFF for per-chunk attribution runs) |
 | 2026-07-08 | 5-P4b | cudnn.benchmark=True (decoder conv autotune) | (no code) | 48.12 | 48.08 | −0.1% (noise) | — | — | — | — | output bit-identical (same algos picked) | **drop** (heuristics already optimal) |
+| 2026-07-09 | 6-P1 | TCDecoder recurrent-state pointer rotation | `FLASHVSR_TCDECODER_POINTER_STATE` | 49.229 | 49.421 | +0.39% | overlap metric | overlap metric | 15.18 GiB | 15.18 GiB | max\|diff\|=0, F=25/F=89 | keep |
+| 2026-07-09 | 6-P2 | Direct decoder output placement | `FLASHVSR_TCDECODER_DIRECT_OUTPUT` | 49.421 | 49.734 | +0.63% | overlap metric | overlap metric | 15.18 GiB | 15.44 GiB | max\|diff\|=0, F=25/F=29/F=89 | keep |
+| 2026-07-09 | 6-P3 | Exact MemBlock pointwise fusion | `FLASHVSR_TCDECODER_FUSE_POINTWISE` | 49.734 | 50.945 | +2.43% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0 incl. BF16 special values | keep |
+| 2026-07-09 | 6-P4 | Channels-last nearest upsample kernel | `FLASHVSR_TCDECODER_UPSAMPLE` | 50.945 | 52.302 | +2.66% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0; isolated 7.7–8.6x | keep |
+| 2026-07-09 | 6-P5 | Exact LQ Conv3D im2col packer | `FLASHVSR_CONV3D_PACKER=triton` | 52.302 | 53.009 | +1.35% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | exact patch matrix + E2E max\|diff\|=0 | keep |
+| 2026-07-09 | 6-P6 | Channels-last recurrent concat kernel | `FLASHVSR_TCDECODER_CONCAT` | 53.009 | 53.423 | +0.78% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0; isolated 1.7–1.8x | keep |
+| 2026-07-09 | 6b-P1 | Reordered TGrow->unpack+upsample fusion | `FLASHVSR_TCDECODER_TGROW_UP` | 53.40 | 54.61 | **+2.27%** | overlap metric | overlap metric | 15.44 GiB | 15.6 GiB | max\|diff\|=0 E2E (F=25/29/89 @768, F=25/29/41 @1536); isolated 2.2–5.4x; @1536 F=41 spot 14.36→14.69 (+2.30%) | keep |
+| 2026-07-09 | 6b-P2 | cuDNN runtime-fused Conv+Bias(+Add)+ReLU | `FLASHVSR_TCDECODER_CUDNN_FUSED` | 54.58 | 55.91 | **+2.44%** | overlap metric | overlap metric | 15.6 GiB | 15.6 GiB | **quality-gated**: E2E 55.4–55.8 dB PSNR (gate 49); isolated 70 dB, ~10–14% of values ±1 ULP; @1536 F=41 spot 14.69→15.07 (+2.59%) | keep (quality-gated) |
+| 2026-07-09 | 6b-P3 | Triton `tl.dot` RGB tail conv (Cout=3, N=16-pad) | (prototype only) | 54.58 | — | −4% isolated | — | — | — | — | 65 dB isolated; best 0.351 ms vs cuDNN 0.335 ms — L2-BW bound at 9x activation re-reads | **drop** (fails ≥15% isolated bar) |
 
 #### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
 
@@ -831,6 +840,138 @@ tail is untouched ~540 ms serialized (or ~34% co-executed under overlap) —
 further FPS needs decoder-side work (Phase 4D compile-fusion under the PSNR
 gate) or accepting the ~49–50 FPS plateau @768.
 
+### Phase 6 — Lossless decoder and LQ kernels (2026-07-09)
+
+Fresh Phase-5 production baseline (three-run median, 768x1408 F=81) was
+**49.229 FPS**. Every candidate was toggled independently on the same stack,
+then the cumulative stack was compared bit-for-bit at F=29 and F=89.
+
+- Pointer-state rotation removes 231 recurrent D2D copies (10.54 GiB traffic)
+  without changing decoder state order.
+- Direct output placement removes the serialized final chunk concatenation and
+  skips materializing the three causal warm-up RGB frames.
+- MemBlock Triton pointwise kernels preserve the eager BF16 materialization
+  after bias and residual addition; special-value and E2E tests are bit-exact.
+- The nearest-neighbor kernel reads each channels-last input pixel once and
+  writes four outputs; isolated speedup is 7.7–8.6x on production shapes.
+- The LQ packer changes only `unfold/permute/reshape` materialization. The
+  existing `torch.addmm`, output layout, normalization, and arithmetic remain
+  unchanged; isolated packing speedup is 1.85–2.30x.
+- The recurrent concat kernel packs `[current, past]` in one channels-last
+  pass and is 1.7–1.8x faster in isolation.
+
+**Cumulative result:** 49.229 → **53.423 FPS** (+8.52%) at 768x1408; peak
+allocated memory 15.18 → 15.44 GiB. One phase-closure run at 1536x2560 reached
+**14.684 FPS** versus the previous 13.435 (+9.30%), with 47.76 GiB allocated.
+The post-review strict rerun reached 53.484 FPS at 768x1408 with every expected
+route count satisfied and no recorded fallback.
+`test_phase5_lossless.py phase6` reports `max|diff|=0` at 768x1408 F=29/F=89
+and 1536x2560 F=29/F=41. The `F=29` case confirms direct output matches the
+existing 21-frame cat behavior for accepted `8n+5` inputs. The final profile
+reduced decoder kernel work 518.8 → 393.7 ms
+and decoder launches 3860 → 2969.
+
+Rejected experiments were removed from production code: TGrow packing was
+bit-exact but reduced FPS and added ~0.5 GiB; direct causal LQ packing was
+bit-exact but 0.37% slower; standalone Triton ReLU was slower, while cuDNN's
+fused Conv+ReLU changed BF16 output values.
+
+### Phase 6b — Decoder conv-body campaign (2026-07-09)
+
+Quality budget for this phase (user-approved): **>= 49 dB E2E PSNR** against
+the current stack; bitwise preferred where free. Fresh NCU on the four cuDNN
+decoder conv families showed 75–93% SM/tensor SOL for the MemBlock/transition
+convs (no custom-GEMM headroom) and 42% SOL only for the narrow-N final RGB
+conv. The analyzer now folds `decode0..N` NVTX ranges into a `decode` phase
+and defaults to the true steady window `chunks 3..7`.
+
+- **6b-P1 `FLASHVSR_TCDECODER_TGROW_UP` (keep, lossless):** the three
+  `Upsample(2x) -> TGrow(1x1)` pairs are algebraically reordered: the bias-free
+  1x1 conv runs at LOW resolution (4x fewer FLOPs), then one Triton kernel
+  unpacks the temporal channel groups and nearest-upsamples straight into
+  contiguous channels-last frames (removing the high-res TGrow packing
+  copies). Isolated 2.2x/5.2x/5.4x on the three sites; measured bit-identical
+  E2E at 768x1408 (F=25/29/89) and 1536x2560 (F=25/29/41) — cuDNN picked the
+  same reduction order at both spatial sizes. Production strict 3-run medians:
+  53.40 → **54.61 FPS** (+2.27%).
+- **6b-P2 `FLASHVSR_TCDECODER_CUDNN_FUSED` (keep, quality-gated):** MemBlock
+  chains run as cuDNN runtime-fused `conv+bias+ReLU`, `conv+bias+ReLU`,
+  `conv+bias+residual+ReLU`, and the standalone Conv->ReLU pairs (latent conv,
+  IdentityConv deepening, full-res tail) fuse via
+  `aten.cudnn_convolution_relu`. Replaces the separate exact epilogue kernels
+  (~31 ms/call) with zero extra launches. NOT bit-exact: the fused engine
+  skips the intermediate BF16 materializations (isolated ~70 dB, ~10–14% of
+  values ±1 ULP; E2E **55.4–55.8 dB** vs the lossless stack at both
+  resolutions). Production strict 3-run medians: 54.58 → **55.91 FPS**
+  (+2.44%).
+- **6b-P3 Triton RGB tail conv (drop):** `tl.dot` N=16-padded kernel reached
+  65 dB but 0.351 ms vs cuDNN 0.335 ms on (1,128,1408,768): the formulation
+  re-reads activations 9x through L2 (~2.5 GB/frame) and is L2-bandwidth
+  bound; beating the 42%-SOL sm80 kernel needs an smem-halo design (Gluon),
+  which fails the >=15% isolated bar for this phase.
+
+**Cumulative:** 53.423 → **55.91 FPS** (+4.66%) at 768x1408 F=81 (3-run
+medians). 1536x2560 F=41 single-run spot-checks, all three configs measured
+back-to-back in one same-process-free batch (`runs/phase6b_1536_isolated/`)
+on the same Phase-6 base: baseline **14.36** → +TGROW_UP **14.69**
+(+2.30%, 46.0 → 46.4 GiB) → +both **15.07 FPS** (+4.94% vs this fresh 1536
+baseline, 46.4 GiB unchanged). Note this fresh 14.36 FPS/46.0 GiB baseline
+run differs slightly from the 14.684 FPS / 47.76 GiB number logged at the
+original Phase-6 closure (different session/allocator state); all Phase-6b
+deltas above are same-batch, same-session comparisons and are the numbers to
+trust for this phase. Decoder-stream kernel work 392.0 → **299.9 ms** and
+decoder launches 2969 → **2089** (nsys `phase6b_fused_current` @768, both
+flags on). With `TCDECODER_CUDNN_FUSED=0` the stack remains strictly
+`max|diff|=0` at **54.61 FPS** @768 / **14.69 FPS** @1536. Campaign total
+@768 vs Step 0: 38.585 → 55.91 = **+44.9%** (lossless-only, i.e.
+`CUDNN_FUSED=0`: 38.585 → 54.61 = **+41.5%**).
+
+Next candidates (measured, not yet implemented): DiT residual/LayerNorm/AdaLN
+row fusion (~15.3 ms/chunk budget on the denoise stream, expected +2–4%),
+MemBlock concat elimination via split-K dual `cudnn_convolution_add_relu`
+(~20.6 ms/call concat kernel), true circular K/V arenas (+0.3–0.8%).
+
+### Phase 7 — 60 FPS push (2026-07-09)
+
+Target: 60 FPS at 768x1408 F=81, three-run untraced median, with the
+user-approved >=49 dB E2E PSNR gate. Fresh Phase-6b baseline was **56.085 FPS**
+(55.920 / 56.085 / 56.098); an `nvidia-smi -lgc 1980` A/B was neutral-to-negative
+(56.089 / 56.028 / 55.854, median 56.028), so the default clock policy remains.
+
+- **P7-A `FLASHVSR_DIT_ROW_FUSION` (keep, quality-gated):** a Triton row kernel
+  fuses affine-free LayerNorm -> AdaLN for `norm1`/`norm2`; a second kernel
+  performs the broadcast residual gate. Isolated `8448x1536`: LN+AdaLN
+  0.242 -> 0.026 ms, gate 0.040 -> 0.024 ms. E2E F=25/F=89: 49.78 / 49.88 dB;
+  strict 3-run F=81: 56.085 -> **56.398 FPS** (+0.56%). The large isolated gain
+  is largely hidden by decoder co-execution and warm chunks.
+- **P7-B `FLASHVSR_MASKGEN_THRESHOLD_CACHE` (keep, quality-gated):** the first
+  two per-block geometries retain exact `kthvalue`; later steady chunks reuse
+  the previous threshold. F=89 used 60 exact and 210 cached threshold routes,
+  with 51.72 dB against the prior mask path. It composes with P7-A at 49.60 dB.
+- **P7-C `FLASHVSR_TCDECODER_SPLITK_CONV` (keep, quality-gated):** split the
+  first MemBlock 3x3 weights into current/past halves, pre-cache channels-last
+  views, and use `cudnn_convolution_add_relu`; no recurrent concat is
+  materialized. Isolated three decoder shapes gained 3–10% at ~68.9 dB; F=89
+  E2E was 58.13 dB. A+B+C F=29/F=89 was 49.81 / **49.59 dB**.
+- **Cumulative A+B+C:** **57.256 FPS** (57.256 / 57.213 / 57.358) versus the
+  fresh 56.085 baseline, **+2.09%**. Steady chunks were ~135 ms; peak 15.59 GiB.
+  All expected routes passed under `FLASHVSR_REQUIRE_FASTPATHS=1` with no
+  fallback.
+- **P7-D `FLASHVSR_CONV3D_EINSUM` (drop):** direct strided contraction made
+  isolated conv2 8.39 -> 7.91 ms and passed combined quality at 49.56 dB, but
+  the F=81 A+B+C+D median regressed to **56.741 FPS**. Decoder/DiT co-execution
+  erased the local saving.
+- **P7-E `KV_RINGBUF_SPARE=8` (drop):** removed all 60 F=81 arena compactions
+  and stayed bit-exact at F=89, but its one-run 57.518 FPS probe did not repeat:
+  A+B+C+E three-run median was **57.200 FPS** with peak memory 24.3 GiB
+  (+8.7 GiB). Default spare remains 2.
+
+**Decision:** promote A+B+C to the GH200 preset. The 60 FPS target was not
+reached under the >=49 dB gate: 57.26 FPS leaves 4.8% E2E headroom. Remaining
+material levers are Track-2 attention softmax/WGMMA overlap (high integration
+risk; prior named-barrier attempt was unstable) or an explicitly approved
+quality/algorithm trade in mask density.
+
 ### Entry template (copy-paste per attempt)
 
 ```markdown
@@ -895,6 +1036,10 @@ gate) or accepting the ~49–50 FPS plateau @768.
 | 8 | + FFMA-softmax (3.5-1a, in triton2) + **FUSED_CSR** | 46.383 | 118.84 ms | 15.62 GiB | +20.2% FPS vs Step 0 / +11.68% vs the 2A set | Phase 3.5 exact-math pack; both lossless-class (PSNR 50.08 / bit-eq CSR); @1536 +10.5% |
 | 9 | + ROPE_KERNEL=triton + POOLED_K_CACHE + ATTN_ZEROCOPY | 48.268 | 112.24 ms | 15.64 GiB | **+25.1%** FPS vs Step 0 | Phase 5 P1-P3, all bit-exact (max\|diff\|=0) |
 | 10 | + DECODER_OVERLAP (production set) | **49.237** | 164.88 ms (denoise+decode) | 15.18 GiB | **+27.6%** FPS vs Step 0 | P4a: overlap re-promoted at +2.01% on the shorter chunk; keep OFF for per-chunk attribution runs |
+| 11 | + Phase-6 pointer/direct-output/pointwise/upsample/LQ-packer/concat | **53.423** | overlap metric | 15.44 GiB | **+38.5%** FPS vs Step 0 / +8.52% vs fresh Phase-5 | All Phase-6 paths bit-identical vs Phase-5 production |
+| 12 | + `TCDECODER_TGROW_UP` (Phase 6b, lossless) | **54.61** | overlap metric | 15.6 GiB | **+41.5%** FPS vs Step 0 | bit-identical incl. 1536 F=25/29/41 |
+| 13 | + `TCDECODER_CUDNN_FUSED` (Phase 6b, quality-gated) | **55.91** | overlap metric | 15.6 GiB | **+44.9%** FPS vs Step 0 | E2E 55.4 dB PSNR vs Step 12 (gate 49 dB) |
+| 14 | + P7 `DIT_ROW_FUSION` + `MASKGEN_THRESHOLD_CACHE` + `TCDECODER_SPLITK_CONV` | **57.256** | overlap metric | 15.59 GiB | **+48.4%** FPS vs Step 0 / +2.41% vs Step 13 | Combined F=29/F=89 PSNR 49.81/49.59 dB vs Step 13 (gate 49 dB) |
 
 ---
 
@@ -906,3 +1051,6 @@ gate) or accepting the ~49–50 FPS plateau @768.
 | 2026-07-08 | 3 | 2A set + ATTN_BACKEND=triton2 (OFF ref same session: 11.472 / 503.22 ms / 48.39 GiB) | 12.436 | 449.24 ms | 48.39 GiB | Phase-3 attention v2 spot-check: +8.4% FPS, −53.98 ms/chunk, peak unchanged — the kernel win holds at scale (attention share scale-invariant, ANALYSIS §0). |
 | 2026-07-08 | 3.5 | 2A set + triton2 + FUSED_CSR (OFF ref same session: 11.461 / 503.38 ms) | 12.669 | 438.20 ms | 48.39 GiB | Phase-3.5 spot-check: +10.5% FPS, −65.2 ms/chunk vs OFF — FFMA-softmax + fused CSR hold/grow at scale. |
 | 2026-07-08 | 5 | + ROPE_KERNEL + POOLED_K_CACHE + ATTN_ZEROCOPY | 13.194 | 414.32 ms | 48.49 GiB | Phase-5 P1-P3 spot: +4.1% vs Phase-3.5 set. With +DECODER_OVERLAP: **13.435 FPS** / 46.82 GiB — campaign total @1536: 11.01 → 13.44 (**+22.0%**). |
+| 2026-07-09 | 6 | Phase-5 production + all Phase-6 lossless paths | **14.684** | 527.7 ms median (decode overlap included) | 47.76 GiB | Single phase-closure run, strict fast paths; +9.30% vs Phase-5 production. F=41 parity max\|diff\|=0. |
+| 2026-07-09 | 6b | Same-batch baseline → +`TGROW_UP` → +`CUDNN_FUSED` | 14.36 → 14.69 → **15.07** | — | 46.0 → 46.4 → 46.4 GiB | Three single strict runs, same session/batch; TGROW_UP bit-identical @1536 (+2.30%), CUDNN_FUSED 55.7–55.8 dB E2E PSNR (+2.59% more). Combined +4.94% vs this fresh baseline. |
+| 2026-07-09 | 7 | Phase-6b + `DIT_ROW_FUSION` + `MASKGEN_THRESHOLD_CACHE` + `TCDECODER_SPLITK_CONV` | **15.415** | 641.1 ms (chunk 2 single spot) | 46.46 GiB | Strict F=41 spot, +2.3% vs the 15.07 Phase-6b reference. Combined F=29 quality gate: 49.95 dB vs the Phase-6b production stack. |
