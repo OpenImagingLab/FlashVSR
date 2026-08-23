@@ -48,7 +48,8 @@ Thanks to the community for the fast adoption of FlashVSR! Below are some third-
 - WaveSpeed AI: https://wavespeed.ai/models/wavespeed-ai/flashvsr  
 - Segmind: https://www.segmind.com/models/flashvsr  
 - Genbo AI: https://genbo.ai/models/toVideo/Flash-VSR
-- JAI Portal: https://www.jaiportal.com/model/flashvsr  
+- JAI Portal: https://www.jaiportal.com/model/flashvsr
+- cnaps.ai: https://cnaps.ai
 - FlashVSR Online Service (third-party): https://flashvsr.org  
 - GigapixelAI Video Upscaler (FlashVSR option): https://gigapixelai.com/ai-video-upscaler
 ---
