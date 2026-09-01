@@ -35,7 +35,8 @@ Diffusion models have recently advanced video restoration, but applying them to 
 Thanks to the community for the fast adoption of FlashVSR! Below are some third-party integrations:
 
 **ComfyUI Support**
-- **[smthemex/ComfyUI_FlashVSR](https://github.com/smthemex/ComfyUI_FlashVSR)** — closer to the official implementation  
+- **[smthemex/ComfyUI_FlashVSR](https://github.com/smthemex/ComfyUI_FlashVSR)** — closer to the official implementation
+- **[https://github.com/tl2012tl/TE-Speed-FlashVSR](https://github.com/tl2012tl/TE-Speed-FlashVSR)** - adds motion‑aware dynamic acceleration, SpargeAttn sparse‑attention support and an optimized video‑combining encoder
 - **[lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast](https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast)** — modified attention behavior, easier installation, and added `tile_dit`; I have not personally tested this version
 - **[naxci1/ComfyUI-FlashVSR_Stable](https://github.com/naxci1/ComfyUI-FlashVSR_Stable)** — community-maintained stable ComfyUI implementation with VRAM optimizations
 - **WanVideoWrapper** — integrated support but currently has known issues  
