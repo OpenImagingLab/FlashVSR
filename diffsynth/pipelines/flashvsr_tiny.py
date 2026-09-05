@@ -16,7 +16,126 @@ from ..models import ModelManager
 from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
+from ..nvtx_utils import nvtx_range
+from ..perf_stats import record as _perf_record, record_error as _perf_error
 from .base import BasePipeline
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A-1a: lossless RoPE freqs cache (FLASHVSR_CACHE_ROPE_FREQS, default OFF).
+#
+# The eager path assembles the per-chunk RoPE freqs tensor on the CPU from
+# `dit.freqs` (three complex128 tables that live on the CPU) and then moves the
+# ~(f*h*w, 1, 64)-complex result to the GPU — every chunk. Profiling (ANALYSIS
+# §4 item 5) shows this as tens of ms of per-chunk CPU wall plus an ~8.6 MB H2D
+# copy @768x1408. The assembly is pure slice/expand/cat (no arithmetic), so
+# performing exactly the same copies on-device from device-resident base tables
+# is bit-identical.
+#
+# Cache layout (bounded memory; shape/dtype/device aware):
+#   dit._rope_base_dev : {device_str: (f_tab, h_tab, w_tab) on device}
+#       one-time H2D copy of the small per-axis freq tables.
+#   dit._rope_freqs_buf: {(f, h, w, device_str): entry}
+#       entry = {"buf":   (f*h*w, 1, D) complex buffer on device,
+#                "hw_done": bool,   # h/w columns written (invariant per key)
+#                "f_start": int}    # temporal offset currently in the f columns
+#
+# Cache key semantics: the assembled tensor depends only on (f, h, w, f_start,
+# device). The h/w columns are invariant for a given (f, h, w); only the f
+# columns depend on the chunk's temporal offset f_start (= 0 for chunk 0, else
+# 4 + 2*idx), so they are rewritten in place when f_start changes. The buffer
+# is consumed strictly inside the current chunk (rope_apply) and never retained
+# by any cache (pre_cache_k/v hold post-RoPE K/V), so in-place reuse is safe.
+# ---------------------------------------------------------------------------
+_CACHE_ROPE_FREQS = os.environ.get("FLASHVSR_CACHE_ROPE_FREQS", "0") != "0"
+
+
+def _rope_freqs_cached(dit, f, h, w, f_start, device):
+    """Device-side cached assembly of the per-chunk RoPE freqs tensor.
+
+    Bit-identical to the eager CPU path: identical source values, identical
+    layout; only copy operations (slice/expand/copy_), no arithmetic.
+    """
+    dev_key = str(device)
+    base_map = getattr(dit, "_rope_base_dev", None)
+    if base_map is None:
+        base_map = {}
+        dit._rope_base_dev = base_map
+    base = base_map.get(dev_key)
+    if base is None:
+        base = tuple(t.to(device) for t in dit.freqs)
+        base_map[dev_key] = base
+    f_tab, h_tab, w_tab = base
+    fd, hd, wd = f_tab.shape[1], h_tab.shape[1], w_tab.shape[1]
+
+    buf_map = getattr(dit, "_rope_freqs_buf", None)
+    if buf_map is None:
+        buf_map = {}
+        dit._rope_freqs_buf = buf_map
+    key = (f, h, w, dev_key)
+    ent = buf_map.get(key)
+    if ent is None:
+        buf = torch.empty(f * h * w, 1, fd + hd + wd, dtype=f_tab.dtype, device=device)
+        ent = {"buf": buf, "hw_done": False, "f_start": None}
+        buf_map[key] = ent
+    buf = ent["buf"]
+    v = buf.view(f, h, w, fd + hd + wd)
+    if not ent["hw_done"]:
+        v[..., fd:fd + hd].copy_(h_tab[:h].view(1, h, 1, hd).expand(f, h, w, hd))
+        v[..., fd + hd:].copy_(w_tab[:w].view(1, 1, w, wd).expand(f, h, w, wd))
+        ent["hw_done"] = True
+    if ent["f_start"] != f_start:
+        v[..., :fd].copy_(f_tab[f_start:f_start + f].view(f, 1, 1, fd).expand(f, h, w, fd))
+        ent["f_start"] = f_start
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B-1: decoder overlap on a side CUDA stream
+# (FLASHVSR_DECODER_OVERLAP, default OFF).
+#
+# The serialized path decodes ONCE after the whole denoise loop, so the
+# TCDecoder is a fully serialized tail (17-23% of E2E, ANALYSIS §1.1/§3 H6).
+# With the flag ON, each chunk's latents are decoded on a dedicated side
+# stream as soon as they are finalized, so decode N runs concurrently with
+# denoise chunks N+1.. on the main stream. This is a pure scheduling change:
+# the TCDecoder is streaming-capable by construction (TAEHV mem-blocks carry
+# per-timestep state across decode_video calls; `flashvsr_tiny_long.py`
+# decodes per chunk with the same LQ_pre_idx:LQ_cur_idx cond slices), and the
+# per-chunk split feeds the decoder the exact same per-timestep inputs in the
+# exact same order as the one-shot decode -> bit-identical output.
+#
+# Stream / event / lifetime contract:
+#   * main stream  : denoise chunks, final `torch.cat` assembly, color fix.
+#   * decode stream: every TCDecoder op (incl. pixel_shuffle(cond), the
+#                    channels_last weight conversion on first use, and the
+#                    stateful TAEHV.mem updates). Decode calls are enqueued in
+#                    chunk order on ONE stream, so mem-block state transitions
+#                    are identical to the serialized path.
+#   * ready event (per chunk, recorded on main stream): protects the
+#     main->decode handoff. Recorded only after `cur_latents = cur_latents -
+#     noise_pred` is enqueued, i.e. after the decoder input is final (later
+#     iterations only rebind `cur_latents`, they never mutate it in place).
+#   * done event (per chunk, recorded on decode stream): protects the
+#     decode->main handoff. The main stream waits on all done events right
+#     before output assembly (GPU-side wait_event, no CPU sync in the loop).
+#   * Lifetime: decode-stream reads `cur_latents` (kept alive in
+#     `latents_total` for the whole call), `LQ_video` (caller-owned, alive and
+#     read-only for the whole call) and the decoder weights/mem (only ever
+#     touched by the decode stream). `record_stream` is additionally called on
+#     the cross-stream tensors as defense in depth so the caching allocator
+#     inserts event guards even if a future edit drops the references early.
+#   * Ordering: decoded chunks land in a list indexed by chunk id and are
+#     concatenated in that order -> output ordering is identical to the
+#     serialized path by construction (never completion order).
+# ---------------------------------------------------------------------------
+_DECODER_OVERLAP = os.environ.get("FLASHVSR_DECODER_OVERLAP", "0") != "0"
+
+# Write each overlapped decoder chunk directly into its final temporal slice.
+# This removes the serialized post-wait torch.cat and skips stacking the three
+# causal warm-up frames that are trimmed from chunk 0. Copy-only, opt-in.
+_DECODER_DIRECT_OUTPUT = os.environ.get(
+    "FLASHVSR_TCDECODER_DIRECT_OUTPUT", "0") != "0"
 
 
 # -----------------------------
@@ -337,6 +456,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         latents = noise
 
         process_total_num = (num_frames - 1) // 8 - 2
+        if process_total_num < 1:
+            raise ValueError("FlashVSR Tiny requires at least 25 input frames")
         is_stream = True
 
         # 清理可能存在的 LQ_proj_in cache
@@ -348,8 +469,60 @@ class FlashVSRTinyPipeline(BasePipeline):
         LQ_pre_idx = 0
         LQ_cur_idx = 0
 
+        # Phase 2B-1 (FLASHVSR_DECODER_OVERLAP): per-chunk decode on a side
+        # stream. See the module-level comment above `_DECODER_OVERLAP` for
+        # the full stream/event/lifetime contract.
+        use_decoder_overlap = (
+            _DECODER_OVERLAP and LQ_video is not None and LQ_video.is_cuda
+        )
+        if _DECODER_OVERLAP and not use_decoder_overlap:
+            _perf_record("decoder_overlap_unavailable")
+        if use_decoder_overlap:
+            if getattr(self, "_decode_stream", None) is None:
+                # One side stream per pipeline instance, reused across calls
+                # (warmup + measured) so allocator pools stay stable.
+                self._decode_stream = torch.cuda.Stream(device=LQ_video.device)
+            main_stream = torch.cuda.current_stream(LQ_video.device)
+            # Slots indexed by chunk id -> assembly is always in logical chunk
+            # order, regardless of decode completion order.
+            direct_decoder_output = _DECODER_DIRECT_OUTPUT
+            if direct_decoder_output:
+                # Chunk 0 yields 21 RGB frames after causal trim; every later
+                # two-latent chunk yields eight. For accepted 8n+5 inputs this
+                # deliberately matches the existing cat path, which ignores
+                # the final four input frames rather than returning unwritten
+                # output storage.
+                decoded_frame_count = 21 + 8 * (process_total_num - 1)
+                try:
+                    frames = torch.empty(
+                        (1, 3, decoded_frame_count, height, width),
+                        dtype=self.torch_dtype, device=LQ_video.device)
+                    frames.record_stream(self._decode_stream)
+                except Exception as exc:
+                    _perf_error("decoder_direct_output", exc)
+                    if os.environ.get("FLASHVSR_REQUIRE_FASTPATHS", "0") != "0":
+                        raise
+                    torch.cuda.empty_cache()
+                    direct_decoder_output = False
+            if not direct_decoder_output:
+                decoded_chunks = [None] * process_total_num
+            decode_done_events = [None] * process_total_num
+
+        # Profiling window (FLASHVSR_NVTX tooling): cudaProfilerStart at chunk
+        # PROF_START, cudaProfilerStop after chunk PROF_STOP-1 (i.e. window is
+        # [start, stop)). Read at call time so a warmup call can run with the
+        # window disabled and the measured call can enable it via os.environ.
+        # Default -1/-1 -> disabled, zero behaviour change.
+        _prof_start = int(os.environ.get("FLASHVSR_PROFILER_START_CHUNK", "-1"))
+        _prof_stop = int(os.environ.get("FLASHVSR_PROFILER_STOP_CHUNK", "-1"))
+
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num)):
+            for cur_process_idx in progress_bar_cmd(range(process_total_num)):
+                if _prof_start >= 0 and cur_process_idx == _prof_start:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.start()
+                nvtx_chunk = nvtx_range(f"chunk{cur_process_idx}")
+                nvtx_chunk.__enter__()
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
@@ -386,48 +559,133 @@ class FlashVSRTinyPipeline(BasePipeline):
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
                 # 推理（无 motion_controller / vace）
-                noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
-                    self.dit,
-                    x=cur_latents,
-                    timestep=self.timestep,
-                    context=None,
-                    tea_cache=None,
-                    use_unified_sequence_parallel=False,
-                    LQ_latents=LQ_latents,
-                    is_full_block=is_full_block,
-                    is_stream=is_stream,
-                    pre_cache_k=pre_cache_k,
-                    pre_cache_v=pre_cache_v,
-                    topk_ratio=topk_ratio,
-                    kv_ratio=kv_ratio,
-                    cur_process_idx=cur_process_idx,
-                    t_mod=self.t_mod,
-                    t=self.t,
-                    local_range = local_range,
-                )
+                with nvtx_range("dit_forward"):
+                    noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
+                        self.dit,
+                        x=cur_latents,
+                        timestep=self.timestep,
+                        context=None,
+                        tea_cache=None,
+                        use_unified_sequence_parallel=False,
+                        LQ_latents=LQ_latents,
+                        is_full_block=is_full_block,
+                        is_stream=is_stream,
+                        pre_cache_k=pre_cache_k,
+                        pre_cache_v=pre_cache_v,
+                        topk_ratio=topk_ratio,
+                        kv_ratio=kv_ratio,
+                        cur_process_idx=cur_process_idx,
+                        t_mod=self.t_mod,
+                        t=self.t,
+                        local_range = local_range,
+                    )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
+                # NOTE: in overlap mode `latents_total` doubles as the
+                # lifetime guard that keeps each chunk's decoder input alive
+                # until the final decode sync (do not drop this append).
                 latents_total.append(cur_latents)
+
+                if use_decoder_overlap:
+                    # ---- Phase 2B-1: hand chunk `cur_process_idx` to the ----
+                    # ---- decode stream and keep denoising on main.       ----
+                    # `cur_latents` is final here (nothing after this point
+                    # writes to it; next iteration rebinds the name). The
+                    # ready event fences all main-stream work that produced it.
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(main_stream)
+                    with torch.cuda.stream(self._decode_stream):
+                        self._decode_stream.wait_event(ready_event)
+                        with nvtx_range(f"decode{cur_process_idx}"):
+                            # Same call/cond slicing as the serialized decode,
+                            # split per chunk (semantics identical to
+                            # flashvsr_tiny_long.py); mul_/sub_ run on the
+                            # decode stream and only touch decode-owned memory.
+                            if direct_decoder_output:
+                                frame_start = 0 if cur_process_idx == 0 \
+                                    else 21 + (cur_process_idx - 1) * 8
+                                frame_count = 21 if cur_process_idx == 0 else 8
+                                output = frames[:, :, frame_start:
+                                                frame_start + frame_count]
+                                output_ntchw = output.transpose(1, 2)
+                            else:
+                                output_ntchw = None
+                            try:
+                                dec = self.TCDecoder.decode_video(
+                                    cur_latents.transpose(1, 2),
+                                    parallel=False,
+                                    show_progress_bar=False,
+                                    cond=LQ_video[:, :, LQ_pre_idx:LQ_cur_idx, :, :],
+                                    out=output_ntchw,
+                                ).transpose(1, 2).mul_(2).sub_(1)
+                            except Exception as exc:
+                                if direct_decoder_output:
+                                    _perf_error("decoder_direct_output", exc)
+                                raise
+                            _perf_record("decoder_overlap_chunks")
+                            if direct_decoder_output:
+                                _perf_record("decoder_direct_output_chunks")
+                        done_event = torch.cuda.Event()
+                        done_event.record(self._decode_stream)
+                    # Defense in depth: tell the caching allocator these
+                    # main-stream allocations are consumed by the decode
+                    # stream, so any future free is event-guarded even if the
+                    # Python references above were ever dropped early.
+                    cur_latents.record_stream(self._decode_stream)
+                    LQ_video.record_stream(self._decode_stream)
+                    if not direct_decoder_output:
+                        decoded_chunks[cur_process_idx] = dec
+                    decode_done_events[cur_process_idx] = done_event
+
                 LQ_pre_idx = LQ_cur_idx
+                nvtx_chunk.__exit__(None, None, None)
+                if _prof_stop >= 0 and cur_process_idx == _prof_stop - 1:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
 
-            latents = torch.cat(latents_total, dim=2)
+            if use_decoder_overlap:
+                # ---- Phase 2B-1: final (and only) decode synchronization ----
+                # GPU-side ordering only: the main stream waits on the decode
+                # done events; no torch.cuda.synchronize() and no CPU block.
+                # All decodes were already enqueued inside the chunk loop.
+                with nvtx_range("decode_wait"):
+                    for done_event in decode_done_events:
+                        main_stream.wait_event(done_event)
+                    if direct_decoder_output:
+                        _perf_record("decoder_direct_output_complete")
+                    else:
+                        for dec in decoded_chunks:
+                            # Decode-stream allocations are read by the
+                            # main-stream cat below; event-guard their free.
+                            dec.record_stream(main_stream)
+                        # Assemble strictly in chunk-id order.
+                        frames = torch.cat(decoded_chunks, dim=2)
+                        _perf_record("decoder_final_cat")
+            else:
+                latents = torch.cat(latents_total, dim=2)
 
-            # Decode
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+                # Decode
+                with nvtx_range("decode"):
+                    frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+                    _perf_record("decoder_serialized_calls")
 
             # 颜色校正（wavelet）
             try:
                 if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
-            except:
-                pass
+                    with nvtx_range("color_fix"):
+                        frames = self.ColorCorrector(
+                            frames.to(device=LQ_video.device),
+                            LQ_video[:, :, :frames.shape[2], :, :],
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method='adain'
+                        )
+                    _perf_record("color_fix_success")
+            except Exception as exc:
+                _perf_error("color_fix", exc)
+                if os.environ.get("FLASHVSR_REQUIRE_FASTPATHS", "0") != "0":
+                    raise
 
         return frames[0]
 
@@ -507,7 +765,8 @@ def model_fn_wan_video(
     **kwargs,
 ):
     # patchify
-    x, (f, h, w) = dit.patchify(x)
+    with nvtx_range("patchify"):
+        x, (f, h, w) = dit.patchify(x)
 
     win = (2, 8, 8)
     seqlen = f // win[0]
@@ -518,18 +777,23 @@ def model_fn_wan_video(
     kv_len = int(kv_ratio)
 
     # RoPE 位置（分段）
-    if cur_process_idx == 0:
-        freqs = torch.cat([
-            dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    else:
-        freqs = torch.cat([
-            dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    with nvtx_range("rope_freqs"):
+        if _CACHE_ROPE_FREQS:
+            # 2A-1a: on-device cached assembly (bit-identical, no CPU work/H2D).
+            f_start = 0 if cur_process_idx == 0 else 4 + cur_process_idx * 2
+            freqs = _rope_freqs_cached(dit, f, h, w, f_start, x.device)
+        elif cur_process_idx == 0:
+            freqs = torch.cat([
+                dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        else:
+            freqs = torch.cat([
+                dit.freqs[0][4 + cur_process_idx*2:4 + cur_process_idx*2 + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # TeaCache（默认不启用）
     tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False
@@ -548,27 +812,30 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
-            if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
-            x, last_pre_cache_k, last_pre_cache_v = block(
-                x, context, t_mod, freqs, f, h, w,
-                local_num, topk,
-                block_id=block_id,
-                kv_len=kv_len,
-                is_full_block=is_full_block,
-                is_stream=is_stream,
-                pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
-                pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
-                local_range = local_range,
-            )
-            if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
-            if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
+            with nvtx_range(f"blk{block_id}"):
+                if LQ_latents is not None and block_id < len(LQ_latents):
+                    x = x + LQ_latents[block_id]
+                x, last_pre_cache_k, last_pre_cache_v = block(
+                    x, context, t_mod, freqs, f, h, w,
+                    local_num, topk,
+                    block_id=block_id,
+                    kv_len=kv_len,
+                    is_full_block=is_full_block,
+                    is_stream=is_stream,
+                    pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
+                    pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+                    local_range = local_range,
+                )
+                if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
+                if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
 
-    x = dit.head(x, t)
+    with nvtx_range("head"):
+        x = dit.head(x, t)
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import get_sp_group
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
-    x = dit.unpatchify(x, (f, h, w))
+    with nvtx_range("unpatchify"):
+        x = dit.unpatchify(x, (f, h, w))
     return x, pre_cache_k, pre_cache_v
