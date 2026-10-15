@@ -24,6 +24,7 @@ Diffusion models have recently advanced video restoration, but applying them to 
 
 ### 📰 News
 
+- **Oct 2026 — 🎉 [FlashVSR+](https://github.com/OpenImagingLab/FlashVSR_Plus) released!** Our new work introduces **Hybrid Attention** for efficient one-step VSR and **Reward-Yield DMD (RY-DMD)** for reward-aware post-training with black-box rewards. Inference code, pretrained models, and training data are now available. [[Project Page](https://flashvsr.tech/)] [[Paper](https://arxiv.org/abs/2610.17552)]  
 - **Nov 2025 — 🎉 [FlashVSR v1.1](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1) released:** enhanced stability + fidelity  
 - **Oct 2025 — [FlashVSR v1](https://huggingface.co/JunhaoZhuang/FlashVSR)  (initial release)**: Inference code and model weights are available now! 🎉  
 - **Bug Fix (October 21, 2025):** Fixed `local_attention_mask` update logic to prevent artifacts when switching between different aspect ratios during continuous inference.  
