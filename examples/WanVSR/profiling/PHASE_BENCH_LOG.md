@@ -1,0 +1,1056 @@
+# FlashVSR Phase-2+ Benchmark Log
+
+Chronological, append-only log of every optimization attempt (successes,
+failures, and reverts alike). Governed by the rules in
+[`PHASE_ROADMAP.md`](./PHASE_ROADMAP.md) §0.5 and §5.
+
+**The gate:** do not start the next optimization until the current one has
+(a) an entry in this file and (b) a 2–3 sentence interpretation.
+
+Measurement rules (short form):
+- Untraced `run_pipe_target.py` runs only; 3 runs back-to-back, log the median.
+- Before/after measured at the same commit, flag OFF vs flag ON.
+- @768x1408 F=81 mandatory; @1536x2560 only at phase closure.
+- Lossless claims: `max|diff| == 0`. Numeric-neutral claims: PSNR ≥ 49 dB.
+- Traced (nsys/ncu) runs are attribution-only — never headline numbers.
+
+---
+
+## Step 0 — Fresh Phase-2 baseline (MUST be filled before the first change)
+
+Command (from `examples/WanVSR/`):
+
+```bash
+FLASHVSR_CONV3D_BACKEND=gemm FLASHVSR_TCDECODER_CHANNELS_LAST=1 \
+FLASHVSR_FUSE_NORM=1 FLASHVSR_ATTN_BACKEND=triton \
+FLASHVSR_CACHE_MOD=1 FLASHVSR_CACHE_MASK_BIAS=1 FLASHVSR_PROF_STEADY=off \
+/root/FlashVSR/venv/bin/python profiling/run_pipe_target.py
+```
+
+| Field | Value |
+|---|---|
+| Date/time | 2026-07-08 ~08:30 |
+| Commit | df94d94 (phase1 instrumentation committed on top of 613bf9f) |
+| GPU clocks locked | y (`nvidia-smi -lgc 1980,1980`) |
+| Resolution / frames | 768x1408 / F=81 |
+| Run 1 / Run 2 / Run 3 FPS | 38.585 / 38.525 / 38.594 |
+| **Median FPS (= Phase-2 baseline)** | **38.585** |
+| Median steady chunk ms | **156.28** (156.28 / 156.50 / 156.18) |
+| Peak memory GiB | 12.6 |
+| Reference (Phase-1 campaign, single run) | 38.55 FPS · 156.24 ms · 12.6 GiB |
+| Notes | GPU otherwise idle, no compute apps; logs: `profiling/runs/phase2a/step0_baseline_run{1..3}.log`. Matches Phase-1 reference within noise. |
+
+---
+
+## Per-change entries
+
+<!-- Append one table row + one entry block per optimization attempt.
+     Newest at the bottom. Do not delete failed attempts. -->
+
+| Date | Phase | Optimization | Flag | FPS Before | FPS After | Delta | Steady Chunk Before | Steady Chunk After | Peak Mem Before | Peak Mem After | Correctness | Decision |
+|------|-------|--------------|------|------------|-----------|-------|---------------------|--------------------|-----------------|----------------|-------------|----------|
+| 2026-07-08 | 2A-1a | RoPE freqs device cache | `FLASHVSR_CACHE_ROPE_FREQS` | 38.585 | 38.592 | +0.02% | 156.28 ms | 156.30 ms | 12.60 GiB | 12.63 GiB | max\|diff\|=0 (bit-identical) | keep-behind-flag |
+| 2026-07-08 | 2A-1b | Fused RoPE apply | `FLASHVSR_FUSE_ROPE` | 38.585 | 39.023 | +1.14% | 156.28 ms | 153.62 ms | 12.60 GiB | 12.60 GiB | max\|diff\|=0 (bit-identical) | keep-enabled |
+| 2026-07-08 | 2A-2 | KV cache arena (no per-chunk cat) | `FLASHVSR_KV_RINGBUF` | 39.023 | 39.429 | +1.04% | 153.62 ms | 150.76 ms | 12.60 GiB | 15.50 GiB | max\|diff\|=0 over 9 chunks | keep-enabled |
+| 2026-07-08 | 2A-3 | Attention strided IO (no transposes) | `FLASHVSR_ATTN_STRIDED_IO` | 39.429 | 41.099 | +4.24% | 150.76 ms | 141.14 ms | 15.50 GiB | 15.50 GiB | kernel + E2E max\|diff\|=0 | keep-enabled |
+| 2026-07-08 | 2A-4 | mask_gen lean (kthvalue + no repeat + seqlens cache) | `FLASHVSR_MASKGEN_LEAN` | 41.099 | 41.477 | +0.92% | 141.14 ms | 139.00 ms | 15.50 GiB | 15.50 GiB | mask equality + E2E max\|diff\|=0 | keep-enabled |
+| 2026-07-08 | 2A-5 | LQ projector lean (pad fold + no clones) | `FLASHVSR_LQPROJ_LEAN` | 41.477 | 41.580 | +0.25% | 139.00 ms | 138.46 ms | 15.50 GiB | 15.62 GiB | E2E max\|diff\|=0 (after dropping sub-item b) | keep-enabled |
+| 2026-07-08 | 2A-6 | CUDA Graphs on steady chunk | (not implemented) | 41.580 | — | — | 138.46 ms | — | 15.62 GiB | — | n/a | postpone (go/no-go gate failed) |
+| 2026-07-08 | 2B-1 | Decoder overlap on side CUDA stream | `FLASHVSR_DECODER_OVERLAP` | 41.662 | 42.373 | +1.71% | 138.30 ms | 190.58 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | E2E max\|diff\|=0 (full+short clip, 3x repeats) | keep-behind-flag |
+| 2026-07-08 | 2B-2 | FP8 GEMM infra (e4m3 `_scaled_mm` + Triton rowwise quant) | `FLASHVSR_FP8_GEMM` | 41.704 | 42.986 | +3.07% | 137.98 ms | 132.96 ms | 15.62 GiB | 16.65 GiB | PSNR 40.70 dB (full scope; NOT lossless by design — Phase-4 gate) | keep-behind-flag (Phase-4 enable gate) |
+| 2026-07-08 | 2B-3 | Fused mask-gen threshold-select (Triton radix select+compare) | `FLASHVSR_FUSED_MASKGEN` (removed) | 42.00 | 41.84 | −0.4% (harness E2E) | — | — | 15.62 GiB | 15.62 GiB | mask + E2E max\|diff\|=0 (exact) | **revert** (bit-exact but performance-negative) |
+| 2026-07-08 | 3 | Warp-specialized block-sparse attention v2 (Gluon producer/consumer + pingpong) | `FLASHVSR_ATTN_BACKEND=triton2` | 41.692 | 45.466 | **+9.05%** | 137.96 ms | 122.06 ms | 15.62 GiB | 15.62 GiB | kernel cos ≥0.999995 vs block_sparse (all densities + degenerates); E2E PSNR 50.03 dB; repeats bit-identical; default paths max\|diff\|=0 | keep-behind-flag (ncu gate 3/4; residency 12 warps/SM WS vs ≥16 letter) |
+| 2026-07-08 | 3.5-1a | Attention v2 FFMA-form softmax (scaled-max domain) | (in `triton2`) | 45.466 | 46.112 | +1.42% | 122.06 ms | 119.92 ms | 15.62 GiB | 15.62 GiB | kernel cos 0.999996 all densities+degenerate; E2E PSNR 50.08 dB; repeat bit-identical | keep (in triton2) |
+| 2026-07-08 | 3.5-1b | alpha==1 bit-exact rescale skip | (experiment) | 46.112 | — | — | — | — | — | — | bit-exact but −7% isolated kernel | **drop** (branch+reduce > overlapped FMULs) |
+| 2026-07-08 | 3.5-1c | explicit pingpong named-barrier | (experiment) | 46.112 | — | — | — | — | — | — | n/a | **drop** (deadlock risk; already ~83% peak, HGMMA only 13.6%) |
+| 2026-07-08 | 3.5-2 | Fused CSR build (sort-free cumsum-scatter) | `FLASHVSR_FUSED_CSR` | 46.112 | 46.383 | +0.59% | 119.92 ms | 118.84 ms | 15.62 GiB | 15.62 GiB | idx[0:cnt]+cnt bit-eq vs argsort (all densities+degenerate); v2 output max\|diff\|=0 | keep-behind-flag (lossless; recommended-with-triton2) |
+| 2026-07-08 | 3.5-3 | Decoder overlap × v2 remeasure | `FLASHVSR_DECODER_OVERLAP` | 46.383 | 47.239 | +1.85% | 118.84 ms | 172.9 ms (absorbs decode) | 15.62 GiB | 15.16 GiB | inherited lossless (2B-1, backend-orthogonal); tail 543→126 ms | keep-behind-flag (co-exec 31.7% vs 34.1%; v2 did NOT free the ceiling) |
+| 2026-07-08 | 3.5-4 | RoPE freqs device cache × v2 remeasure | `FLASHVSR_CACHE_ROPE_FREQS` | 46.383 | 46.429 | +0.10% (noise) | 118.84 ms | 118.40 ms | 15.62 GiB | 15.65 GiB | lossless (2A-1a) | keep-behind-flag (still FPS-neutral @768 under v2) |
+| 2026-07-08 | 4A | RoPE fp32 (fused apply) | `FLASHVSR_ROPE_FP32` (reverted) | — | — | ~0 (x1.01 isolated) | — | — | — | — | ≤1 bf16 ULP (numerically fine) | **drop** (no speedup — rope is interleave-access-bound at ~400 GB/s, not fp64-bound) |
+| 2026-07-08 | 4B | FP8 GEMM blockwise (`_scaled_mm_v2` 1x128 act + 1x128 weight) | `FLASHVSR_FP8_GEMM_MODE=blockwise` | — | — | isolated GEMM ×1.13–1.34 | — | — | — | +1.0 GiB | full-scope PSNR **41.00 dB** (ffn 42.71 / qkv,o,lq 43.51 / lq 49.49) | keep-behind-flag, **NOT enable-eligible** (only speed-neutral `lq` clears ≥49) |
+| 2026-07-08 | 4C | FP8 attention (e4m3 K/V) quality de-risk probe | `FLASHVSR_ATTN_FP8_PROBE` (reverted) | — | — | — | — | — | — | — | E2E PSNR **34.96 dB** (optimistic bound) | **drop** (gate unreachable — attention far more e4m3-sensitive than GEMMs; no kernel written) |
+| 2026-07-08 | 5-P1 | Coalesced RoPE kernel (u32 pairs + direct complex128 reads) | `FLASHVSR_ROPE_KERNEL=triton` | 46.383 | 47.780 | **+3.01%** | 118.84 ms | 113.72 ms | 15.62 GiB | 15.62 GiB | kernel bit-eq (triton==fused==eager, both shapes); E2E max\|diff\|=0 | keep (recommended) |
+| 2026-07-08 | 5-P2 | Incremental pooled-K cache (rolling mean mirror) | `FLASHVSR_POOLED_K_CACHE` | 47.780 | 47.858 | +0.16% | 113.72 ms | 113.08 ms | 15.62 GiB | 15.64 GiB | probe: batched mean bit-eq; E2E max\|diff\|=0 + repeat bit-eq | keep (recommended) |
+| 2026-07-08 | 5-P3 | Zero-copy V windowing (rank-4 TMA raster arena + raster out) | `FLASHVSR_ATTN_ZEROCOPY` | 47.858 | 48.268 | +0.86% | 113.08 ms | 112.24 ms | 15.64 GiB | 15.64 GiB | kernel zc-vs-std bit-eq (incl. ring offset); E2E max\|diff\|=0 + repeat bit-eq | keep (recommended, requires triton2) |
+| 2026-07-08 | 5-P4a | Decoder overlap on the P1-P3 stack | `FLASHVSR_DECODER_OVERLAP` | 48.268 | 49.237 | **+2.01%** | 112.24 ms | 164.88 ms (absorbs decode) | 15.64 GiB | 15.18 GiB | lossless (2B-1, unchanged code) | **promote** (production set; keep OFF for per-chunk attribution runs) |
+| 2026-07-08 | 5-P4b | cudnn.benchmark=True (decoder conv autotune) | (no code) | 48.12 | 48.08 | −0.1% (noise) | — | — | — | — | output bit-identical (same algos picked) | **drop** (heuristics already optimal) |
+| 2026-07-09 | 6-P1 | TCDecoder recurrent-state pointer rotation | `FLASHVSR_TCDECODER_POINTER_STATE` | 49.229 | 49.421 | +0.39% | overlap metric | overlap metric | 15.18 GiB | 15.18 GiB | max\|diff\|=0, F=25/F=89 | keep |
+| 2026-07-09 | 6-P2 | Direct decoder output placement | `FLASHVSR_TCDECODER_DIRECT_OUTPUT` | 49.421 | 49.734 | +0.63% | overlap metric | overlap metric | 15.18 GiB | 15.44 GiB | max\|diff\|=0, F=25/F=29/F=89 | keep |
+| 2026-07-09 | 6-P3 | Exact MemBlock pointwise fusion | `FLASHVSR_TCDECODER_FUSE_POINTWISE` | 49.734 | 50.945 | +2.43% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0 incl. BF16 special values | keep |
+| 2026-07-09 | 6-P4 | Channels-last nearest upsample kernel | `FLASHVSR_TCDECODER_UPSAMPLE` | 50.945 | 52.302 | +2.66% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0; isolated 7.7–8.6x | keep |
+| 2026-07-09 | 6-P5 | Exact LQ Conv3D im2col packer | `FLASHVSR_CONV3D_PACKER=triton` | 52.302 | 53.009 | +1.35% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | exact patch matrix + E2E max\|diff\|=0 | keep |
+| 2026-07-09 | 6-P6 | Channels-last recurrent concat kernel | `FLASHVSR_TCDECODER_CONCAT` | 53.009 | 53.423 | +0.78% | overlap metric | overlap metric | 15.44 GiB | 15.44 GiB | max\|diff\|=0; isolated 1.7–1.8x | keep |
+| 2026-07-09 | 6b-P1 | Reordered TGrow->unpack+upsample fusion | `FLASHVSR_TCDECODER_TGROW_UP` | 53.40 | 54.61 | **+2.27%** | overlap metric | overlap metric | 15.44 GiB | 15.6 GiB | max\|diff\|=0 E2E (F=25/29/89 @768, F=25/29/41 @1536); isolated 2.2–5.4x; @1536 F=41 spot 14.36→14.69 (+2.30%) | keep |
+| 2026-07-09 | 6b-P2 | cuDNN runtime-fused Conv+Bias(+Add)+ReLU | `FLASHVSR_TCDECODER_CUDNN_FUSED` | 54.58 | 55.91 | **+2.44%** | overlap metric | overlap metric | 15.6 GiB | 15.6 GiB | **quality-gated**: E2E 55.4–55.8 dB PSNR (gate 49); isolated 70 dB, ~10–14% of values ±1 ULP; @1536 F=41 spot 14.69→15.07 (+2.59%) | keep (quality-gated) |
+| 2026-07-09 | 6b-P3 | Triton `tl.dot` RGB tail conv (Cout=3, N=16-pad) | (prototype only) | 54.58 | — | −4% isolated | — | — | — | — | 65 dB isolated; best 0.351 ms vs cuDNN 0.335 ms — L2-BW bound at 9x activation re-reads | **drop** (fails ≥15% isolated bar) |
+
+#### 2026-07-08 09:00 · Phase 2A-1a · RoPE freqs device cache
+
+- Commit / patch: on top of df94d94 (committed as phase2a rope freqs cache)
+- Files changed: `diffsynth/pipelines/flashvsr_tiny.py` (+ new `test_phase2a_lossless.py` harness)
+- Flag: `FLASHVSR_CACHE_ROPE_FREQS` (default OFF)
+- Env vars used (full set): full-knob baseline + flag under test
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_CACHE_ROPE_FREQS=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: n)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 38.585 → 38.592 (+0.02%, noise) — 3-run medians
+- Steady chunk before → after (Δ): 156.28 → 156.30 ms (noise)
+- Peak mem before → after: 12.60 → 12.63 GiB (+30 MB: device freqs buffers f=6 and f=2)
+- Correctness: `test_phase2a_lossless.py CACHE_ROPE_FREQS` → max|diff| == 0 (PASS)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-behind-flag
+- Interpretation: the ~44 ms/chunk `rope_freqs` cost seen in *traced* runs is CPU
+  wall that rides entirely under the 156 ms GPU chunk in untraced runs, so
+  removing it does not move FPS @768 — consistent with the roadmap note that
+  this is "CPU-side headroom", not GPU time. The change is bit-identical and
+  removes per-chunk CPU tensor construction + an 8.6 MB H2D, which matters for
+  CPU-loaded deployments and is a precondition for CUDA-graph capture (2A-6),
+  so it stays available behind its flag rather than being reverted.
+
+#### 2026-07-08 09:25 · Phase 2A-1b · Fused RoPE apply
+
+- Commit / patch: phase2a fused rope apply
+- Files changed: `diffsynth/models/wan_video_dit.py` (`rope_apply` + compiled impl)
+- Flag: `FLASHVSR_FUSE_ROPE` (default OFF)
+- Env vars used (full set): full-knob baseline + `FLASHVSR_FUSE_ROPE=1`
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_FUSE_ROPE=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 38.585 → 39.023 (+1.14%) — 3-run medians
+- Steady chunk before → after (Δ): 156.28 → 153.62 ms (−2.66 ms)
+- Peak mem before → after: 12.60 → 12.60 GiB
+- Correctness: kernel-level max|diff|=0 on real shape; E2E
+  `test_phase2a_lossless.py FUSE_ROPE` → max|diff| == 0 (exceeds the ≥49 dB gate)
+- Isolated kernel: eager 0.181 ms/call → fused 0.128 ms/call (×1.41, 60 calls/chunk)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: got −2.7 ms of the −8 ms roadmap ceiling: the estimate double
+  counted freqs-side effects, and the fp64 multiply itself (not just the
+  materialized intermediates) is part of the cost, so the fused kernel is
+  compute-bound at ~0.13 ms/call rather than pure-BW ~0.02 ms. Output is
+  bit-identical since the same fp64 operations are performed in one kernel.
+  Remaining rope headroom (folding the apply into the attention prologue or
+  fp32 freqs) is Phase-4 territory (numerics change).
+
+#### 2026-07-08 09:55 · Phase 2A-2 · KV cache arena (kv_cat removal)
+
+- Commit / patch: phase2a kv cache arena
+- Files changed: `diffsynth/models/wan_video_dit.py` (`_KVArena`, `SelfAttention.forward`)
+- Flag: `FLASHVSR_KV_RINGBUF` (default OFF); tuning: `FLASHVSR_KV_RINGBUF_SPARE` (default 2)
+- Env vars used (full set): full-knob baseline + `FLASHVSR_FUSE_ROPE=1` (kept set) + flag under test
+- Exact benchmark command: §0.4 primary command + `FLASHVSR_FUSE_ROPE=1 FLASHVSR_KV_RINGBUF=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 39.023 → 39.429 (+1.04%) — 3-run medians
+- Steady chunk before → after (Δ): 153.62 → 150.76 ms (−2.86 ms)
+- Peak mem before → after: 12.60 → 15.50 GiB (+2.9 GiB = 2 spare arena slots × 60 tensors)
+- Correctness: `test_phase2a_lossless.py KV_RINGBUF` → max|diff| == 0 over a
+  9-chunk clip (exercises slot rotation AND tail compaction)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: recovers essentially the whole kv_cat budget (−2.9 of the
+  3.4 ms attribution): new windows are partition-written straight into the
+  arena (no extra traffic) and only the amortized compaction remains — visible
+  as ~+2.5 ms on every 3rd chunk in the per-chunk trace. Bit-identical since
+  the live view preserves value order and contiguity exactly. Cost is +2.9 GiB
+  retained memory (documented; `FLASHVSR_KV_RINGBUF_SPARE` trades memory for
+  compaction frequency, and the flag restores the old path entirely).
+
+#### 2026-07-08 10:20 · Phase 2A-3 · Attention-path strided IO
+
+- Commit / patch: phase2a attention strided IO
+- Files changed: `diffsynth/models/triton_block_sparse_attn.py`
+  (`_bsfa_tma_kernel_snd`, `triton_block_sparse_attention_snd`),
+  `diffsynth/models/wan_video_dit.py` (glue branch in `flash_attention`)
+- Flag: `FLASHVSR_ATTN_STRIDED_IO` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1`) + flag under test
+- Exact benchmark command: §0.4 primary + `FLASHVSR_FUSE_ROPE=1 FLASHVSR_KV_RINGBUF=1 FLASHVSR_ATTN_STRIDED_IO=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536: at phase closure)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 39.429 → 41.099 (+4.24%) — 3-run medians
+- Steady chunk before → after (Δ): 150.76 → 141.14 ms (−9.62 ms)
+- Peak mem before → after: 15.50 → 15.50 GiB
+- Correctness: kernel-level max|diff| == 0 vs contiguous path on the real
+  shape (both TMA and non-TMA variants); E2E
+  `test_phase2a_lossless.py ATTN_STRIDED_IO` → max|diff| == 0 (exceeds the
+  ≥49 dB gate)
+- Isolated: contiguous glue+kernel 2.851 ms/call → strided 2.514 ms/call;
+  strided is even faster than the kernel alone on pre-copied inputs
+  (2.558 ms) — per-head tiles are adjacent in the (S, n*d) layout, so TMA
+  loads of neighbouring heads share L2 lines
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: −9.6 of the −11.6 ms ceiling: all four transpose copies are
+  gone; the residual is the win_part/win_rev reorder that was counted in the
+  same bucket. Bit-identical because the tile schedule and accumulation order
+  are unchanged — only addressing moved from flattened (H·S, D) descriptors
+  to 2D (S, H·D) descriptors with per-head column offsets. TMA=0 fallback is
+  also strided (stride-general kernel), and any failure falls back to the
+  contiguous triton path, not to the sparse backend.
+
+#### 2026-07-08 10:45 · Phase 2A-4 · mask_gen allocation / sync cleanup
+
+- Commit / patch: phase2a mask_gen lean
+- Files changed: `diffsynth/models/wan_video_dit.py`
+  (`generate_draft_block_mask`, `flash_attention` sparse branch)
+- Flag: `FLASHVSR_MASKGEN_LEAN` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1 ATTN_STRIDED_IO=1`) + flag under test
+- Exact benchmark command: §0.4 primary + kept set + `FLASHVSR_MASKGEN_LEAN=1`
+- Resolution / frames: 768x1408 / F=81
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.099 → 41.477 (+0.92%) — 3-run medians
+- Steady chunk before → after (Δ): 141.14 → 139.00 ms (−2.14 ms)
+- Peak mem before → after: 15.50 → 15.50 GiB
+- Correctness: threshold + boolean-mask exact equality vs topk on random /
+  heavy-tie / softmax-distributed inputs at the real shape; E2E
+  `test_phase2a_lossless.py MASKGEN_LEAN` → max|diff| == 0
+- Isolated: topk(k=7920 of 17424) 0.187 ms → kthvalue 0.076 ms per call
+  (30 calls/chunk); plus removal of the boolean-mask repeat copy; sparse
+  backend additionally gets persistent cu_seqlens/head_mask_type (hidden H2D
+  sync removed — benefits the sparse fallback path, not the triton bench)
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: −2.1 ms banked (roadmap estimated −1–2 ms for the lean pass;
+  the kthvalue swap alone projected −3.3 ms isolated but part of the chain is
+  latency that overlaps with neighbouring small kernels). Mask semantics are
+  provably unchanged — same order statistic, ties behave identically, strict
+  `>` compare untouched. The remaining ~5 ms of the mask_gen chain needs the
+  fused top-k kernel (Phase 2B-3), not more hygiene.
+
+#### 2026-07-08 11:10 · Phase 2A-5 · LQ projector allocation/layout cleanup
+
+- Commit / patch: phase2a lq projector lean
+- Files changed: `examples/WanVSR/utils/utils.py` (`CausalConv3d._forward_lean`,
+  `_conv3d_gemm(contig_out=)`, `Causal_LQ4x_Proj.stream_forward`)
+- Flag: `FLASHVSR_LQPROJ_LEAN` (default OFF)
+- Env vars used (full set): full-knob baseline + kept set
+  (`FUSE_ROPE=1 KV_RINGBUF=1 ATTN_STRIDED_IO=1 MASKGEN_LEAN=1`) + flag under test
+- Exact benchmark command: §0.4 primary + kept set + `FLASHVSR_LQPROJ_LEAN=1`
+- Resolution / frames: 768x1408 / F=81
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.477 → 41.580 (+0.25%) — 3-run medians
+- Steady chunk before → after (Δ): 139.00 → 138.46 ms (−0.54 ms, ~noise floor)
+- Peak mem before → after: 15.50 → 15.62 GiB (persistent pad buffers + view retention)
+- Correctness: E2E `test_phase2a_lossless.py LQPROJ_LEAN` → max|diff| == 0
+  across a full clip (streaming cache exercised across chunk boundaries)
+- Sub-item REJECTED during development: skipping the GEMM output
+  `.contiguous()` (layout-only in values) changed `F.normalize`'s reduction
+  accumulation order → measured max|diff|=0.397 / PSNR 49.9 dB, which
+  violates this item's lossless gate. Dropped; documented in code. Could be
+  revisited under a Phase-4 numerics-tolerant gate if the projector becomes
+  hot again.
+- Nsight report path: n/a (untraced only)
+- Decision: keep-enabled (joins recommended set)
+- Interpretation: the kept copies-only cleanup (fold cat+F.pad into one
+  buffer write, drop streaming-cache clones) recovers ~0.5 ms of the ~1–2 ms
+  estimate — pad+cat was only ~8% of the projector path, and the addmm (65%)
+  and im2col gather (29%) are untouched by design. Since 2A-5 recovered
+  <2 ms, the roadmap gate keeps Phase 2B-4 (fused im2col-GEMM) on the table.
+
+#### 2026-07-08 11:40 · Phase 2A-6 · CUDA Graphs go/no-go gate → NO-GO (postpone)
+
+- Commit / patch: none (gate evaluation only, per roadmap §2A-6)
+- Nsight report path: `profiling/reports/p2a_stack_768/` (nsys minimal trace,
+  full 2A stack, steady window chunks 2–6; attribution-only, not headline FPS)
+- Gate input 1 — idle: corrected steady-chunk idle with the full 2A stack is
+  0.6–2.5% (avg ~1.8%, `analysis.md` busy/idle table) → below the ≥2% go
+  threshold; ceiling ≤ ~3 ms/chunk @768 and ~0 at higher resolutions.
+- Gate input 2 — capture safety: the steady body is NOT capture-stable
+  today: (a) the 2A-2 KV arena advances a Python-int slice offset every chunk
+  and compacts on a data-dependent schedule (a captured graph would freeze
+  both), (b) LQ conditioning slices a different video range per chunk,
+  (c) the 2A-1a freqs buffer is rewritten per chunk (solvable — update
+  outside the graph — but only relevant if (a)/(b) were solved). Fixing (a)
+  requires a true ring buffer with device-side index remapping — exactly the
+  "invasive changes" this experiment is instructed not to expand into.
+- Decision: postpone (documented no-go; do not implement in 2A)
+- Interpretation: after the 2A cleanup the chunk is even less launch-bound
+  than the 3.1% Phase-1 measurement, so the graphs ceiling shrank while its
+  implementation cost grew (arena offsets). Attribution cross-checks the
+  stack wins: kv_cat memcpy 3.4 → ~0.5 ms/chunk, rope 10.1 → ~7.4, mask_gen
+  7.4 → ~4.4, attn transposes gone, `_bsfa_tma_kernel_snd` unchanged at
+  2.03 ms/call. Revisit graphs only if Phase 2B/3 work makes the steady body
+  static (or if deployment shows CPU contention).
+
+#### 2026-07-08 · Phase 2B-1 · Step 2 — fresh Phase-2A-stack baseline (2B-1 starting point)
+
+Re-measured at `45b2ddd` (pre-change), full 2A recommended stack ON, decoder
+overlap absent. Command = §0.4 primary + `FLASHVSR_FUSE_ROPE=1
+FLASHVSR_KV_RINGBUF=1 FLASHVSR_ATTN_STRIDED_IO=1 FLASHVSR_MASKGEN_LEAN=1
+FLASHVSR_LQPROJ_LEAN=1`; clocks locked 1980 MHz.
+
+| Field | Value |
+|---|---|
+| Run 1 / 2 / 3 FPS | 41.780 / 41.759 / 41.686 |
+| **Median FPS (= 2B-1 baseline)** | **41.759** |
+| Median steady chunk ms | 137.46 (137.46 / 136.90 / 137.96) |
+| Peak memory GiB | 15.62 |
+| Reference (Phase 2A closure) | 41.580 FPS · 138.46 ms · 15.62 GiB |
+| Notes | Matches the 2A closure within noise (+0.4% FPS). Logs: `profiling/runs/phase2b/step2_baseline_run{1..3}.log`. |
+
+#### 2026-07-08 12:40 · Phase 2B-1 · Decoder overlap on a side CUDA stream
+
+- Commit / patch: phase2b decoder overlap. Note: a concurrent duplicate
+  session committed an equivalent variant of this same 2B-1 change as
+  7cecb65 mid-campaign; this entry and the follow-up commit supersede it
+  (same design, independently implemented and fully re-validated — the
+  numbers in THIS entry correspond to the tree at the follow-up commit).
+- Files changed: `diffsynth/pipelines/flashvsr_tiny.py` (flag + overlap path),
+  `examples/WanVSR/profiling/run_pipe_target.py` (additive `[tail]`
+  post-loop-ms print), new `examples/WanVSR/profiling/test_decoder_overlap_lossless.py`
+- Flag: `FLASHVSR_DECODER_OVERLAP` (default OFF; serialized end-of-loop decode
+  path is byte-identical code when OFF)
+- Design: after each chunk's `cur_latents -= noise_pred` a ready-event is
+  recorded on the main stream; a persistent side stream waits on it and runs
+  `TCDecoder.decode_video` for that chunk (cond slice `LQ_pre_idx:LQ_cur_idx`,
+  same per-chunk semantics as `flashvsr_tiny_long.py`); per-chunk done-events
+  are waited on by the main stream only once, right before output assembly
+  (`wait_event`, GPU-side, no CPU sync); decoded chunks are assembled from a
+  chunk-id-indexed list → output order is structural, never completion order.
+  TAEHV mem-block state is only ever touched by the decode stream; decode
+  inputs stay alive in `latents_total`; `record_stream` guards added as
+  defense in depth.
+- Env vars used (full set): full-knob baseline + 2A kept set + flag under test
+- Exact benchmark command: §0.4 primary + 2A kept set + `FLASHVSR_DECODER_OVERLAP=1`
+- Resolution / frames: 768x1408 / F=81 (spot-check 1536x2560: y, below)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.662 → 42.373 (+1.71%) — 3-run medians, same commit
+- Steady chunk before → after (Δ): 138.30 → 190.58 ms (+52.3 ms — the chunk
+  wall now absorbs ~50 ms/chunk of decode GPU work + ~12 ms CPU enqueue; this
+  metric is no longer denoise-only when the flag is ON, see interpretation)
+- Decode tail (post-loop) before → after: 561.2 → 125.1 ms (−436 ms hidden)
+- Peak mem before → after: 15.62 → 15.16 GiB (−0.46 GiB: the one-shot
+  20-frame decode working set and the full-latents cat are gone)
+- Correctness: `test_decoder_overlap_lossless.py` → max|diff| == 0,
+  mean|diff| == 0, 85/85 frames bit-equal (ordering), shape/dtype/device
+  identical, on BOTH full clip (F=89, 9 chunks) and short clip (F=25,
+  1 chunk, trim edge); overlap run 3x back-to-back → all repeats bit-identical
+  (no concurrency races). `test_phase2a_lossless.py ALL` re-run → PASS
+  (max|diff|=0, 2A stack unaffected).
+- Nsight report path: `profiling/reports/phase2b_decoder_overlap/`
+  (`profile.nsys-rep`, `profile.sqlite`, `overlap_analysis.txt`). Evidence:
+  decoder kernels (1060 cuDNN convs, 498.7 ms busy) on side stream 13 vs
+  denoise on stream 7; decode active across the whole loop span, not as a
+  tail; 170.2 ms (34.1%) of decode busy time co-executes with denoise
+  kernels; `decode_wait` = 0.1 ms and `color_fix` = 1.6 ms at the end (no
+  per-chunk sync, final sync negligible); GPU idle 1.9% of span.
+- Decision: keep-behind-flag (default OFF)
+- Interpretation: the mechanics work exactly as designed — bit-identical
+  output, decode tail fully hidden (561 → 125 ms), zero hidden syncs, and
+  peak memory *drops* — but the E2E gain is +1.7% @768 / +2.0% @1536, far
+  under the roadmap's +21–29% ceiling. Nsight shows why: the GPU is
+  work-conserving (idle 1.9%), and only ~34% of decode kernel time can
+  co-execute with denoise because the `_bsfa` attention kernel owns a full
+  SM (229 KB smem, 1 CTA/SM) and the decoder's cuDNN conv grids are
+  SM-saturating themselves, so the hardware time-shares instead of
+  co-executing — moving the decode from the tail into the chunks conserves
+  total GPU work and only the co-executed 170 ms (+ warm-chunk gap fill) is
+  actually won. The roadmap estimate implicitly assumed decode could ride on
+  spare SM capacity that doesn't exist under the current attention kernel.
+  Re-evaluate after Phase 3: the planned 2-CTA / warp-specialized attention
+  kernel frees smem headroom, which should raise the co-execution fraction
+  substantially — the flag composes losslessly with everything, so it can be
+  promoted then. Default stays OFF also for campaign hygiene: with the flag
+  ON the `[chunks]` steady metric measures denoise+decode contention rather
+  than denoise alone, which would muddy per-chunk attribution for 2B-2/3/4.
+
+##### Decoder-overlap detail (768x1408 F=81 medians; 1536x2560 single runs)
+
+| Config | E2E FPS | Steady Chunk Time | Decode Tail Time | Peak Memory | Notes |
+|--------|---------|-------------------|------------------|-------------|-------|
+| 768 · 2A stack, overlap OFF | 41.662 | 138.30 ms | 561.2 ms | 15.62 GiB | serialized decode after loop |
+| 768 · 2A stack, overlap ON | 42.373 | 190.58 ms | 125.1 ms | 15.16 GiB | decode rides inside chunks; tail = last-chunk decode remainder + color fix |
+| 1536 · 2A stack, overlap OFF | 11.485 | 502.46 ms | 2046.2 ms | 48.39 GiB | matches 2A closure spot-check (11.489) |
+| 1536 · 2A stack, overlap ON | 11.712 | 682.66 ms | 470.3 ms | 46.72 GiB | +2.0% FPS; decode share is larger at high res but co-execution stays SM-bound |
+
+#### 2026-07-08 13:55 · Phase 2B-2 · FP8 GEMM infrastructure (`torch._scaled_mm`)
+
+- Commit / patch: phase2b fp8 gemm infrastructure (on top of 41f1d8e)
+- Files changed: new `diffsynth/models/fp8_gemm.py` (flag, Triton rowwise
+  quantizer, gelu-fused quantizer, weight pre-cast cache, `_scaled_mm`
+  wrappers with sticky eager fallback), `diffsynth/models/wan_video_dit.py`
+  (qkv shared-quant site, o site, ffn site), `examples/WanVSR/utils/utils.py`
+  (LQ per-layer linears, one shared quant for 30 GEMMs), new
+  `examples/WanVSR/test_fp8_gemm_quality.py`, new
+  `examples/WanVSR/profiling/sweep_fp8_scope.py` (per-site attribution tool
+  for the Phase-4 audit)
+- Flag: `FLASHVSR_FP8_GEMM` (default OFF — **permanently until the Phase-4
+  quality protocol clears it**); scope bisection via
+  `FLASHVSR_FP8_GEMM_SCOPE=qkv,o,ffn,lq` (+`ffn1` token, not in default set)
+- Design: weights pre-cast once to e4m3 with per-out-channel scales (lazy,
+  cached on module, +1.03 GiB); activations quantized per call with per-row
+  scales by ONE Triton kernel (row amax + cast in a single launch — the
+  eager/compiled quantize chain measured ~5x off bandwidth, 113-272 µs, and
+  erased the GEMM win; the kernel does 15.1 µs @ 8448x1536); ffn2's input
+  quant is fused with GELU-tanh (fp32 gelu -> e4m3, replacing the eager bf16
+  GELU pass — on the 8960-wide activation this flips ffn2 from net-loss to
+  net-win); bias fused in `_scaled_mm` epilogue; `use_fast_accum=False`
+- Env vars used (full set): full-knob baseline + 2A kept set + flag under test
+- Exact benchmark command: §0.4 primary + 2A kept set + `FLASHVSR_FP8_GEMM=1`
+- Resolution / frames: 768x1408 / F=81 (1536 spot-check: deferred to phase
+  closure; flag is default-OFF anyway)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6
+- FPS before → after (Δ): 41.704 → 42.986 (+3.07%) — 3-run medians
+- Steady chunk before → after (Δ): 137.98 → 132.96 ms (−5.02 ms)
+- Peak mem before → after: 15.62 → 16.65 GiB (+1.03 GiB e4m3 weight copies)
+- Correctness / quality (Phase-4 protocol measurement, example0 @768):
+  full scope PSNR **40.70 dB** (max|d|=0.875, mean|d|=0.0114) →
+  revert-or-redesign tier for *enablement*. Per-site sweep
+  (`sweep_fp8_scope.py`): qkv 45.58 dB (and net-SLOWER in-pipe) · o 45.05 ·
+  ffn 42.37 (the speed lever AND the quality offender) · ffn1-only 44.15 ·
+  lq 49.08 (recommended tier, speed-neutral) · qkv,o,lq 43.42 ·
+  o,ffn,lq 41.34 — every meaningful-speed combination lands < 45 dB.
+  Flag-OFF neutrality: `test_phase2a_lossless.py ALL` max|diff|=0 PASS,
+  `test_decoder_overlap_lossless.py` PASS (default paths untouched).
+- Kernel evidence: torch.profiler + ncu on the live pipeline steady chunk
+  (`profiling/reports/ncu/phase2b2_fp8_kernels.ncu-rep`): e4m3 GEMMs dispatch
+  `nvjet_sm90_qqtst_128x128_128x6_..._ovscale_bias_TNT` (6/10 sampled nvjet
+  launches) vs bf16 `nvjet_sm90_tst_256x128_...` — FP8 kernels confirmed
+  selected. Isolated GEMM ratios (locked 1980 MHz, pre-quantized inputs):
+  qkv ×1.45-1.53, ffn1 ×1.26-1.38, ffn2 ×1.54, lq ×1.43.
+- Decision: keep-behind-flag (mandatory per roadmap — 2B-2 ships default-OFF
+  regardless of speed; enable decision belongs to Phase 4)
+- Interpretation: the infrastructure works and is net-faster (+3.07% E2E,
+  −5.0 ms/chunk — inside the revised −3.5..−6 ms estimate once dynamic
+  quantization costs are counted; the roadmap's −13 ms ceiling assumed
+  pre-quantized activations). But the distilled one-step model is confirmed
+  fp8-sensitive: 40.7 dB full-scope with errors compounding across the 30
+  blocks and persisting through the KV cache, so **no fp8 configuration is
+  currently enable-eligible**. Phase-4 redesign ticket (in priority order):
+  (1) blockwise/1x128 activation scales (post-GELU outliers dominate the
+  rowwise amax), (2) smoothquant-style weight/activation rebalancing,
+  (3) first/last-block bf16 exclusion, (4) fast-accum A/B. The per-site
+  sweep tool and the `ffn1` scope token exist precisely for that audit.
+
+#### 2026-07-08 14:35 · Phase 2B-3 · Fused mask-gen threshold-select → REVERT
+
+- Commit / patch: developed on top of 3b4b23d, reverted before landing; only
+  this log entry is committed. (Run logs: `profiling/runs/phase2b2/test_fused_maskgen*.log`.)
+- Files changed (during the attempt, all removed on revert):
+  `diffsynth/models/fused_topk_mask.py` (Triton radix-select+compare kernel,
+  single-tile n<=16384 fast path + tiled variant),
+  `diffsynth/models/wan_video_dit.py` (branch in `generate_draft_block_mask`),
+  `examples/WanVSR/profiling/test_fused_maskgen_lossless.py`
+- Flag: `FLASHVSR_FUSED_MASKGEN` (removed with the revert)
+- Scope decision (pre-registered): the exact-mask gate forbids fusing
+  mean-pool/einsum/softmax (any reduction-order change flips ties across the
+  66 concatenated softmax rows whose quotients share a threshold), so the
+  exact-safe fusion is ONLY kthvalue+broadcast+compare → one kernel. The
+  selected threshold is a pure order statistic (a VALUE of the multiset), so
+  any correct selection is bit-identical — no tie-breaking ambiguity.
+- Correctness (the gate PASSED): kernel-level mask equality vs kthvalue AND
+  topk formulations on randn / heavy-tie / softmax-with--inf / all-equal /
+  negative inputs at (12|36)x13068, 12x172800, edge k∈{1,2,n/3,n−1,n} — all
+  exact; E2E max|diff| == 0 vs eager, 2 ON repeats identical.
+- Performance (the reason for the revert): isolated @12x13068,
+  k_smallest=5149: eager kthvalue+compare 59.7 µs vs fused 69.2 µs (x0.86;
+  best of num_warps sweep {4,8,16,32}: 171.6/78.5/69.0/79.7 µs; first tiled
+  version was 113 µs). Harness E2E @768 F=89: OFF 42.00 FPS → ON 41.84/41.62
+  FPS (−0.4..−0.9%). Below the pre-registered keep gate (≥ +0.5%).
+- Peak mem before → after: 15.62 → 15.62 GiB (unchanged)
+- Nsight report path: n/a (kernel-level + harness E2E evidence sufficient
+  for a negative result)
+- Decision: **revert** — code removed cleanly, no flag left behind
+- Interpretation: the roadmap's −5 ms/chunk estimate assumed fusing the
+  whole pool→einsum→softmax→topk chain to ~1 ms, but the exact-mask gate
+  makes everything upstream of the select bitwise-untouchable, and the
+  remaining exact-safe slice (select+compare, ~60 µs/call eager) has no
+  headroom: torch's `kthvalue` is already a single efficient radix-select
+  kernel (the 2A-4 lean pass already banked the topk→kthvalue win), and at
+  rows=12 a one-CTA-per-row fused kernel is latency-bound by 4 dependent
+  histogram rounds (~69 µs floor ≈ eager). The launch-gap latency the fusion
+  removes was already hidden by neighbouring kernels (2A-4 interpretation).
+  Conclusion: mask_gen (~4.4 ms/chunk) is now attention-kernel and
+  numerics-gate bound — further gains require either folding mask
+  generation into the Phase-3 attention kernel v2 or accepting non-bitwise
+  mask changes under the Phase-4 E2E-neutral protocol. 2B-4 (fused
+  im2col-GEMM) remains the only open 2B item.
+
+#### 2026-07-08 · Phase 3 · Step 2 — fresh 2A-stack baseline + kernel isolation (Phase-3 starting point)
+
+Re-measured at the Phase-3 working tree (parent 25811e3), full 2A recommended
+stack, clocks locked 1980 MHz. Command = §0.4 primary + 2A kept set.
+
+| Field | Value |
+|---|---|
+| Run 1 / 2 / 3 FPS (pre-change tree) | 42.115 / 42.048 / 41.830 |
+| **Median FPS** | **42.048** (matches 2B-1 baseline 41.759 within noise) |
+| Median steady chunk ms | 136.88 · peak 15.62 GiB |
+| ncu `_bsfa_tma_kernel_snd` (steady, in-pipe) | 1997.4 µs · SM/tensor SOL 40.7% · occ 12.5% = 1 CTA/SM (178 reg + 229.4 KB smem) · grid 792 = 6.0 waves · L2 92% · stalls barrier 2.36 / wait 1.01 / short_sb 0.55 · no-eligible 68.6% |
+| `bench_ceilings.py` H2 re-run | cuDNN dense 1.945 ms → ideal sparse 1.179 ms (ANALYSIS ref: 1.86 / 1.13) |
+| Shape correction (measured, was undocumented) | steady attention consumes the UNTRIMMED kv window: q 8448 × **kv 33792** (264 blocks) at mask density **0.42–0.45** — FLOP-identical to ANALYSIS's "kv 25344 @ 0.606" framing (~120 active kv blocks/row either way). True ideal-sparse at the real shape/density: dense(33792) 2.576 ms × 0.4213 = **1.085 ms**. |
+| Logs | `profiling/runs/phase3/step2_baseline_run{1..3}.log`, `profiling/reports/ncu/phase3_bsfa_before.{ncu-rep,csv}` |
+
+#### 2026-07-08 16:30 · Phase 3 · Warp-specialized block-sparse attention v2 (`triton2`)
+
+- Commit / patch: phase3 attention v2 (this commit; parent 25811e3)
+- Files changed: new `diffsynth/models/triton_block_sparse_attn_v2.py` (Gluon
+  kernel + wrapper), `diffsynth/models/wan_video_dit.py` (triton2 branch in
+  `flash_attention`, knob doc), new `examples/WanVSR/test_attention_v2.py`,
+  new `examples/WanVSR/profiling/bench_attn_v2.py` (+ captured real mask
+  `profiling/cache/attn_mask_768_steady.pt`)
+- Flag: `FLASHVSR_ATTN_BACKEND=triton2` (default backend remains `sparse`;
+  the recommended-set line keeps `triton` until this entry is independently
+  confirmed). Tuning knobs: `FLASHVSR_ATTN_V2_NBUF` (default 3, measured
+  best), `FLASHVSR_ATTN_V2_PROD_REGS` (default 40, measured best).
+- Design (kernel): FA3-style Gluon warp specialization on sm_90 —
+  1 TMA producer warp group (4 warps @ 40 regs via `worker_num_regs`
+  setmaxnreg reallocation) streams the CSR-selected K/V 128×128 tiles into an
+  NBUF=3-deep smem ring (mbarrier full/empty handshakes, 2×64-col TMA boxes
+  per tile, next-index software prefetch); 2 consumer warpgroups (4 warps
+  each) own 64-row halves of the q block ("pingpong": one WG's softmax
+  overlaps the other's WGMMA) and additionally defer each P·V wgmma by one
+  iteration (issue QK(j) before PV(j−1); in-order retirement lets
+  `wait(pendings=1)` complete QK while PV drains under the softmax).
+  Exact-mask preservation is structural: same `(H,Nqb,Nkvb)` boolean mask,
+  same `_make_csr` (stable argsort → ascending kv-block order), all-false
+  rows → l=0 → l_safe → zero rows. Softmax scale folded into the exponent
+  (matches block_sparse_attn's FA2 formulation; v1 pre-scaled q in bf16).
+- Fallback ladder: triton2 → v1 strided (`_bsfa_tma_kernel_snd`) → v1
+  contiguous → `block_sparse_attn`; any v2 import/compile/launch failure
+  falls through silently. Default `sparse`/`triton` code paths untouched.
+- Route notes (prototyped and rejected):
+  (a) `tl.range(warp_specialize=True)` one-liner on the v1 kernel — the
+  hopper autoWS pass accepted the annotation but did NOT partition
+  (num_warps stayed 8; 1.751 ms = no-op). (b) occupancy tuning for
+  2 CTA/SM (M64/N64/w4 variants) — all slower (1.83–3.32 ms); WGMMA at
+  M64 tiles + no WS loses more than residency gains. (c) BLOCK_N=64
+  2-CTA variant of v2 — needs two wgmma layouts with per-iteration
+  conversions; rejected (compile complexity, expected loss).
+- Isolated kernel (bench_attn_v2.py, real captured mask d=0.4213, locked
+  clocks): v1 kernel-only 1.753 ms → v2 **1.139 ms** (×1.54, 649 TF/s
+  sparse-effective, 95% of the 1.085 ms ideal-sparse ceiling); NBUF/PROD_REGS
+  sweep: {2,3}×{24,40,56} → 3/40 best.
+- ncu acceptance gate (in-pipe steady chunk, `phase3_bsfa_v2_after.ncu-rep`):
+
+| Metric | Gate | Before (`_bsfa_tma_kernel_snd`) | After (`_bsfa_v2_kernel`) | Verdict |
+|---|---|---|---|---|
+| duration @ reference shape | ≤ 1.3 ms | 1997.4 µs | **1260.5 µs** | PASS |
+| tensor pipe (SM SOL) | ≥ 60% elapsed | 40.7% | **66.2%** | PASS |
+| barrier stall /issue | < 1.0 | 2.36 | **0.71** | PASS |
+| residency | ≥2 CTA/SM or WS ≥16 warps/SM | 1 CTA/SM · 8 warps | 1 CTA/SM · **12 warps WS** (4+4 consumers + 4 producer) | PARTIAL (see interpretation) |
+| (info) no-eligible-warp cycles | — | 68.6% | 57.7% | — |
+| (info) stalls long_sb / wait | — | 0.55 / 1.01 | 2.00 / 1.32 | — |
+
+- E2E @768x1408 F=81 (untraced, 3-run medians, same tree, back-to-back):
+  OFF (`triton`) 41.692 FPS / 137.96 ms / 15.62 GiB → ON (`triton2`)
+  **45.466 FPS / 122.06 ms / 15.62 GiB** = **+9.05% FPS, −15.90 ms/chunk,
+  peak unchanged**. Logs `profiling/runs/phase3/e2e_{off,on}_run{1..3}.log`.
+- Quality/correctness: kernel cos vs `block_sparse_attn` ≥ 0.999995 at the
+  real shape across densities {real 0.42, 0.1, 0.3, 0.45, 0.9, all-true} +
+  degenerate all-false masks/rows/heads (all-false rows exactly zero) +
+  determinism (2 calls bit-identical); E2E `test_attention_v2.py`:
+  PSNR(sparse, triton2) = **50.03 dB** (gate ≥49, v1 reference ~49.7),
+  max|d| = 0.3135, triton2 ×2 repeats bit-identical (multi-chunk KV/cache
+  contract stable); `test_phase2a_lossless.py ALL` → max|diff| = 0
+  (default paths byte-identical).
+- nsys attribution (`profiling/reports/phase3_attn_v2/`): `_bsfa_v2_kernel`
+  n=240 (8 chunks × 30 blocks) fully replaces `_bsfa_tma_kernel_snd` (0
+  occurrences); steady chunks 137.96 → 122.06 ms untraced.
+- @1536x2560 spot-check (single runs): OFF 11.472 FPS / 503.22 ms /
+  48.39 GiB → ON **12.436 FPS / 449.24 ms / 48.39 GiB** (+8.4%,
+  −53.98 ms/chunk) — the win holds/grows at scale as predicted
+  (attention share is scale-invariant).
+- Nsight report paths:
+  `profiling/reports/ncu/phase3_bsfa_before.{ncu-rep,csv}`,
+  `profiling/reports/ncu/phase3_bsfa_v2_after.{ncu-rep,csv}`,
+  `profiling/reports/phase3_attn_v2/` (nsys).
+- Decision: **keep-behind-flag** (pre-registered tier: the ncu gate is 3/4 —
+  the residency letter asks ≥2 CTA/SM or ≥16 warps/SM and v2 runs 12
+  warps/SM WS at 1 CTA/SM). Presumptive recommended-set promotion
+  (`FLASHVSR_ATTN_BACKEND=triton2`) after one independent confirming entry,
+  per the two-entry promotion rule.
+- Interpretation: the kernel hit the acceptance window on every *binding*
+  metric — 1.26 ms in-pipe (target ≤1.3; 1.14 ms isolated = 95% of the
+  ideal-sparse ceiling), tensor-active 66.2% (target ≥60), barrier stalls
+  2.36 → 0.71 — confirming the Phase-1 diagnosis that the v1 kernel was
+  scheduling-bound, not math-bound. The residency sub-criterion was
+  deliberately not chased: every ≥16-warp/2-CTA configuration we could
+  construct measured slower (occ variants 1.83–3.32 ms; N=64 2-CTA needs
+  per-iteration layout conversions), i.e. 12-warp warp-specialization with
+  softmax/WGMMA pingpong is the empirically optimal structure here, and the
+  gate's intent (kill the no-eligible-warp starvation) is what the passing
+  metrics measure. E2E banks −15.9 ms/chunk vs the −22.1 ms one would get by
+  naively scaling the single-shape ncu delta (737 µs × 30): that −22.1 was an
+  extrapolation, not a target — the 30 attention calls/chunk span DiT blocks
+  at different densities and warm-cache states, so the measured −15.9 ms is
+  the truth and the gap is extrapolation slack, NOT power throttling.
+  Power/clock was directly measured (nvidia-smi dmon, OFF vs ON busy window):
+  the GPU is a 900 W-capable Hopper enforced to 700 W (the 1000 W Grace+Hopper
+  module budget minus ~300 W reserved for Grace/LPDDR5X), but BOTH backends
+  peak at only ~660 W (v1 666 W / v2 660 W) — never touching the 700 W cap —
+  and BOTH sag identically to ~1650–1800 MHz under the 1980 MHz lock (a
+  heavy-tensor DVFS operating point, not a power or thermal cap: temps 52–56
+  °C, power under limit). Since the sag is backend-independent it cannot be
+  the OFF-vs-ON differential; v2 does the SAME work at the SAME ~660 W in less
+  time = pure efficiency. (An earlier draft of this entry wrongly attributed
+  the gap to an H8 power-cap clawback; corrected here against the dmon data.)
+  @768 lands at 45.5 FPS (+9.1%); the roadmap's 49–51 was itself built on the
+  same optimistic 0.9 ms/call extrapolation. Follow-ups: (1) re-measure `FLASHVSR_DECODER_OVERLAP`
+  co-execution on top of triton2 (v2 still occupies 229 KB smem/SM, so the
+  34% co-execution ceiling probably persists — measure, don't assume);
+  (2) **CORRECTION (PC-sampling, 335k samples, source page):** the aggregate
+   `long_sb=2.00` label is a warp-state classification artifact of the producer
+   warps parked on mbarriers — it is NOT the real limiter. Per-PC sampling
+   attributes warp-time as ~59% softmax f32/MUFU chain (MUFU.EX2 18.9% +
+   FMNMX 14.9% + FADD 12.0% + FMUL 9.7% + F2FP 1.9% + SHFL 2.0%) and ~24%
+   wgmma (HGMMA issue 13.6% + WARPGROUP.DEPBAR 10.0%); producer/TMA/LDG/
+   mbarrier PCs are <1%. The kernel is **softmax-math + wgmma-wait bound, NOT
+   TMA/ring-head bound** — deeper KV prefetch (NBUF) buys nothing; the levers
+   are FFMA-form exp2 (fold `qk*s - m*s` into one FFMA), an alpha==1 bit-exact
+   rescale skip, and explicit pingpong ordering so softmax(WG-A) overlaps
+   HGMMA(WG-B). Isolated 1.139 ms = 95% of the 1.085 ms ideal-sparse ceiling;
+   perfect softmax/wgmma overlap floor ≈ 0.95–1.0 ms in-pipe. (3) FP8 attention (Phase 4) now
+   has a WS substrate to build on.
+
+#### 2026-07-08 · Phase 3.5 · Exact-math efficiency pack (kernel FFMA + fused CSR + overlap/rope remeasures)
+
+Base = commit 1b4d5c6 (triton2 + 2A stack). Clocks locked 1980 MHz. Same-session
+OFF (`triton`) reference (3-run median): **41.531 FPS / 138.94 ms / 15.62 GiB**.
+All runs `profiling/runs/phase3_1/`.
+
+- **3.5-0 log attribution fix** (commit): PC-sampling (335k) showed the kernel is
+  softmax-math (~59%) + wgmma-wait (~24%) bound, NOT TMA/ring-head; the aggregate
+  `long_sb=2.00` was a producer-park artifact. No perf change.
+
+- **3.5-1a FFMA-form softmax** (commit, in `triton2`): track the running max in
+  the pre-scaled (log2e) domain (`ms = m*s`) so the exponent becomes one FFMA
+  `qk*s - ms` instead of the non-contractable `(qk-m)*s`. Isolated kernel
+  1.155 → **1.047–1.087 ms** (−6% median, −9.4% best), in-pipe ncu **1260 → 1179 µs,
+  tensor SOL 66.2 → 71.1%** (barrier 0.71 → 0.87, still < 1.0). Correctness: kernel
+  cos 0.999996 across all densities + degenerate; E2E PSNR(sparse, triton2)
+  **50.08 dB**; triton2 repeat bit-identical. E2E 45.466 → **46.112 FPS** (+1.42%),
+  122.06 → 119.92 ms. ncu report `reports/ncu/phase3_1_bsfa_v2.ncu-rep`.
+- **3.5-1b alpha==1 rescale skip** (dropped): IEEE-exact (x*1.0≡x) but the
+  per-iteration full-reduce + branch cost **more** than the acc-rescale FMULs it
+  skips (those overlap the tensor pipe): isolated 1.047 → 1.126 ms. Reverted.
+- **3.5-1c explicit pingpong named-barrier** (dropped): primitives exist
+  (`inline_asm_elementwise`, `ttgl.barrier`) but the two consumer partitions are
+  separate warp_specialize regions — coordinating a hardware named barrier across
+  them is high deadlock-risk for <few% upside (already ~83% of sustained bf16
+  peak; HGMMA is only 13.6% of warp-time so issue-port collision pressure is low).
+  Revisit only if FP8 attention (4C) raises HGMMA pressure.
+
+- **3.5-2 fused CSR build** (commit, `FLASHVSR_FUSED_CSR`): the v2 kernel reads
+  only `idx[0:cnt]`, so a single-pass `tl.cumsum` scatter reproduces
+  `idx[0:cnt]` + `cnt` bit-identically without `torch.argsort` (radixSort
+  ~0.71 ms/chunk). Lossless: idx[0:cnt]+cnt bit-equal vs `_make_csr` on random/
+  degenerate/all-true/all-false + chunk0 shape; v2 output max|diff|=0 fused vs
+  argsort. E2E 46.112 → **46.383 FPS** (+0.59%), 119.92 → 118.84 ms (−1.08).
+  Default OFF; recommended-with-triton2 (lossless internal-to-v2 detail).
+
+- **3.5-3 decoder overlap × v2** (`FLASHVSR_DECODER_OVERLAP`, measure only):
+  on the triton2+FUSED_CSR base, overlap gives 46.383 → **47.239 FPS** (+1.85%),
+  decode tail 543 → 126 ms, peak −0.46 GiB. nsys (`reports/phase3_1_overlap_v2/`):
+  decode busy 511 ms, co-executed with denoise **162 ms = 31.7%** — vs 2B-1's
+  34.1%. **The v2 kernel did NOT free the co-execution ceiling** (it still holds
+  229 KB smem / 1 CTA per SM, so the decoder's cuDNN conv grids still time-share
+  the SMs). Overlap losslessness inherited from 2B-1 (code byte-identical,
+  backend-orthogonal). Decision unchanged: keep-behind-flag (also < the +2%
+  promote threshold, and it muddies the per-chunk metric).
+
+- **3.5-4 CACHE_ROPE_FREQS × v2** (measure only): 46.383 → 46.429 FPS (+0.10%,
+  noise) — the freqs-construction cost is still CPU-side wall that rides under the
+  (now shorter) GPU chunk untraced. Lossless; keep-behind-flag (unchanged 2A-1a).
+
+**Phase 3.5 result @768:** OFF(triton) 41.531 → recommended triton2+FUSED_CSR
+**46.383 FPS** (+11.68%), 138.94 → 118.84 ms (−20.1); +DECODER_OVERLAP 47.239
+(+13.7% vs OFF). Peak 15.62 GiB unchanged. **@1536 spot:** OFF 11.461 → ON
+12.669 (+10.5%, 503.4 → 438.2 ms) — win holds/grows at scale.
+Interpretation: 3.5-1a is the substantive win (the kernel was softmax-elementwise
+bound as the PC-sampling predicted; folding the exponent to FFMA lifted tensor
+SOL 66→71% and banked −2.1 ms/chunk); 3.5-2 is a clean lossless −1.1 ms;
+3.5-3/3.5-4 are confirmed modest and stay flag-gated (overlap's ceiling is
+smem-bound, not backend-bound — a real Phase-4/5 dependency: only freeing v2's
+229 KB smem would raise co-execution). Recommended-set delta for the campaign:
+promote `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1` after the
+second confirming entry.
+
+#### 2026-07-08 · Phase 4A · RoPE fp32 → DROP (measured perf-neutral)
+
+- Hypothesis (roadmap): rope 8.6 ms/chunk is fp64-ALU-bound; fp32 → ~1.7 ms.
+- Implemented `_rope_apply_fused_fp32_impl` + `FLASHVSR_ROPE_FP32`; isolated
+  A/B at the real shape (1×8448×1536, freqs 8448×1×64): fp64 127.9 µs vs fp32
+  126.3 µs = **x1.01 (noise)**. Numerics fine (≤1 bf16 ULP, ~99.99% bit-equal).
+- Root cause: the fused RoPE kernel already moves only bf16 in/out with the
+  fp64 freqs downcast in-register; at 52 MB / 128 µs it runs at ~400 GB/s
+  (~12% of HBM3) — it is neither fp64-compute nor BW bound but bound by the
+  **strided interleave write pattern** (`torch.stack((o_r,o_i),-1)` + flatten
+  → stride-2 uncoalesced stores). Precision does not touch that, so fp32 buys
+  nothing. Reverted (no flag left).
+- Real rope lever (deferred, numerics-neutral candidate): restructure the
+  interleave so the complex pairs are written coalesced (or fold RoPE into the
+  attention/qkv prologue). Not fp32. Filed for a later structural pass.
+
+#### 2026-07-08 · Phase 4B · FP8 GEMM blockwise (DeepSeek-style 1x128) → NOT enable-eligible at ≥49
+
+- Motivation: 2B-2 rowwise FP8 pinned at 40.70 dB full-scope (ffn the offender,
+  post-GELU per-row amax dominated by outliers). Hypothesis: 1x128 blockwise
+  activation scales isolate those outliers → clear the ≥49 gate.
+- Feasibility (verified): `torch._scaled_mm_v2` + `ScalingType.BlockWise1x128`
+  works on sm_90 (cublasLt ≥12.9, we have CUDA 13.2). Isolated pre-quantized
+  GEMM speedups: ffn1 ×1.15, ffn2 ×1.22, qkv/o ×1.13, lq ×1.34 — LOWER than
+  rowwise (×1.26–1.72) because finer scales cost more, and blockwise activation
+  quant is heavier than per-row amax.
+- Implementation: `fp8_gemm.py` gains `FLASHVSR_FP8_GEMM_MODE=rowwise|blockwise`
+  (default rowwise = 2B-2 unchanged) with eager 1x128 group-quant + weight cast
+  + `_scaled_mm_v2` routing (`_blockquant_eager`, `_weight_fp8_blockwise`,
+  `_linear_blockwise`, `_ffn_blockwise`). Eager quant kept (quality probe) — no
+  fused kernel built, see decision.
+- Quality (Phase-4 protocol, example0 @768, PSNR vs flag-OFF):
+
+  | scope | rowwise (2B-2) | blockwise (4B) | Δ |
+  |---|---|---|---|
+  | full (qkv,o,ffn,lq) | 40.70 | **41.00** | +0.30 |
+  | ffn (the speed lever) | 42.37 | **42.71** | +0.34 |
+  | qkv,o,lq | 43.42 | **43.51** | +0.09 |
+  | lq (speed-neutral) | 49.08 | **49.49** | +0.41 |
+
+- Decision: **keep-behind-flag, NOT enable-eligible.** Blockwise gives only
+  +0.1–0.4 dB everywhere — it does not solve the actual failure mode, which is
+  the distilled one-step model's e4m3 error **compounding across the 30 DiT
+  blocks through the streaming KV cache** (2B-2 finding, now confirmed
+  scale-granularity-independent). The only ≥49 scope is `lq` (49.49) which is
+  speed-neutral, so there is no enable-eligible speed-meaningful configuration
+  at the locked ≥49 gate. No fused blockwise quant kernel was built — optimizing
+  the speed of a path that cannot pass the gate is wasted work.
+- Default neutrality: mode defaults `rowwise`; with `FLASHVSR_FP8_GEMM=0`
+  (default) neither path runs — the eager/`triton`/`sparse` outputs are
+  byte-identical (fp8 code is fully gated by `enabled()`).
+- Remaining FP8-GEMM avenue (Phase-4 backlog, not this session): first/last-block
+  bf16 exclusion + smoothquant rebalancing to break the compounding — but the
+  ceiling is low given rowwise→blockwise moved only 0.3 dB.
+
+#### 2026-07-08 · Phase 4C · FP8 attention → DROP before kernel (quality gate unreachable)
+
+- Plan: e4m3 K/V (+ optional e4m3 P·V) on the v2 WS substrate; expected
+  −9..−11 ms/chunk. Highest single lever, but 4B just showed the model's e4m3
+  error compounds through the KV cache — a strong negative prior since FP8
+  attention puts e4m3 *directly* into that cache.
+- De-risk (no kernel): fake-quant K/V to e4m3 with per-(head, 128-kv-block)
+  amax scales in the v2 glue, kernel otherwise unchanged bf16. This is the
+  **optimistic bound** for a real kernel (no cache-storage compounding; P/PV
+  stay bf16; finest natural scale granularity). E2E `test_attention_v2` e2e:
+  PSNR(sparse, triton2+probe) = **34.96 dB**, max|d|=1.54 — far below the 45
+  revert tier, let alone the ≥49 gate.
+- Root cause: attention is much more e4m3-sensitive than the GEMMs (34.96 vs
+  40–43 dB) because softmax exponentiates QK, amplifying small K errors, and
+  the distilled one-step model has no later denoising steps to correct them.
+- Decision: **drop — do not write the FP8-attention kernel.** The optimistic
+  bound already fails by >14 dB; a real kernel (e4m3 P, e4m3 cache) would be
+  worse. Probe reverted (no code left). Stop-condition honored (PSNR <45 every
+  variant → revert, per roadmap 4C).
+- Consequence for the roadmap trajectory: the FP8 lever (both GEMM and
+  attention) is closed at the ≥49 gate for this distilled model. The remaining
+  denoise-side headroom is structural/lossless (5A) or the deferred rope
+  interleave; the E2E ceiling is now decode-tail bound (%32 wall).
+
+#### 2026-07-08 · Phase 5A · Zero-copy windowing — FEASIBILITY CONFIRMED, deferred
+
+- Rank-4 gluon TMA descriptor `[2,8,8,128]` over raster `(F,H,W,Hh·D)` at
+  `[f0,h0,w0,head·D]` reproduces `WindowPartition3D.partition`'s token order
+  **bit-exactly** (match=True, max|diff|=0) into a 2D `[128,D]` NVMMA smem tile
+  → WGMMA-ready. So win_part/win_rev (5.9 ms/chunk of pure permutation copies)
+  can be removed with no math change.
+- Deferred to a focused session: the integration (KV-arena raster ring +
+  mask_gen raster pooling + 4D output store + multi-chunk arena bit-stability)
+  touches the KV-cache bit-stability contract and must not be rushed. Full spec
+  in `.opencode/plans/hw-efficiency-roadmap.md` §5A. Expected −4..−6 ms/chunk,
+  lossless (max|diff|=0 gate). Flag `FLASHVSR_ATTN_ZEROCOPY`.
+
+#### 2026-07-08 · Phase 3.5–5 campaign closure (this session)
+
+- **Landed (kept):** 3.5-1a FFMA-form softmax + 3.5-2 fused CSR (both in/with
+  `triton2`). @768 OFF(triton) 41.53 → **46.38 FPS (+11.68%)**, 138.9 →
+  118.8 ms; @1536 11.46 → **12.67 FPS (+10.5%)**. Quality: kernel cos 0.999996,
+  E2E PSNR 50.08 dB, CSR bit-exact. Peak unchanged 15.62 GiB.
+- **Measured/kept-flag:** 3.5-3 decoder-overlap ×v2 +1.85% (co-exec 31.7%, the
+  v2 smem monopoly persists — a real Phase-5 dependency); 3.5-4 rope-freqs
+  cache +0.1% (noise); 4B FP8-GEMM blockwise infra (default-OFF, 41.0 dB).
+- **Dropped with evidence (saved dead-end kernel work):** 3.5-1b alpha-skip
+  (−7% isolated), 3.5-1c pingpong barrier (deadlock risk, already 83% peak),
+  4A rope-fp32 (×1.01 — interleave-bound not fp64-bound), 4C FP8-attention
+  (probe 34.96 dB, gate unreachable — attention is far more e4m3-sensitive than
+  GEMMs; no kernel written).
+- **Key finding:** the FP8 lever (GEMM + attention) is closed at the locked
+  ≥49 dB gate for this distilled one-step model — its e4m3 error compounds
+  through the streaming KV cache (4B) and softmax amplifies K errors (4C).
+  Remaining denoise headroom is structural/lossless (5A zero-copy windowing,
+  feasibility-confirmed; deferred rope-interleave); the E2E ceiling is now
+  decode-tail bound (~32% of wall).
+- **Recommended-set delta (pending 2nd confirming entry):**
+  `FLASHVSR_ATTN_BACKEND=triton2` + `FLASHVSR_FUSED_CSR=1`.
+
+#### 2026-07-08 · Phase 5 (P1–P4) · lossless structural pack — session log
+
+Base 46.383 FPS / 118.84 ms (triton2+FUSED_CSR). All items bit-exact
+(max|diff|=0 gates incl. multi-chunk ring rotation + ON-repeat stability).
+Runs: `profiling/runs/phase5/`.
+
+- **P1 coalesced RoPE kernel** (`diffsynth/models/triton_rope.py`): the fused
+  torch.compile RoPE read `freqs.real/.imag` as stride-2 fp64 views (~484 GB/s,
+  143 µs/call). Hand Triton kernel moves bf16 pairs as packed u32 words and
+  reads the complex128 storage directly: 128→36 µs (×3.6; ×3.9 at the chunk0
+  shape). Bit-exactness required matching torch's fp64→fp32→bf16 double-round
+  cast chain (c10::BFloat16 is float-constructed); with it, triton==fused==
+  eager bitwise at both shapes. E2E +3.01%, −5.1 ms/chunk (isolated predicted
+  −5.5 ✓).
+- **P2 incremental pooled-K**: probe first — torch.mean(dim=1) is bitwise
+  independent of batch row count ((264,128,C) == 4×(66,128,C) slices) → GO.
+  Pool each kv window once (when appended), carry pooled rows in a rolling
+  buffer mirroring the cat/trim sequence; self-heals on any length mismatch.
+  +0.16%, −0.6 ms (part of the 1.6 ms reduce was already latency-hidden).
+- **P3 zero-copy V (5A-v1)**: V never feeds mask pooling, so V windowing is
+  pure layout work. `_VRasterArena` keeps V as raster (F,h,w,C) frames
+  (contiguous appends, no permute); the v2 kernel gains RASTER_V (rank-4 TMA
+  box [2,8,8,64] window gather, probe bit-exact incl. ring f0 offsets) and
+  RASTER_OUT (epilogue stores rows straight to raster token order → win_rev
+  eliminated). K/Q stay windowed (their pooled means feed the exact mask;
+  raster pooling would change reduction order — 2B-3 lesson). Fallback: on
+  any zc failure the raster live view is partitioned on the fly and the
+  standard ladder runs. +0.86%, −0.84 ms (of the −2.7 estimate: the removed
+  copies partially overlapped other work, and the scattered raster store is
+  slightly slower than the contiguous window store).
+- **P4a decoder overlap re-eval**: on the shorter denoise chunk the overlap
+  win grew to **+2.01%** (49.237 FPS, tail 543→124 ms, peak −0.46 GiB) —
+  meets the pre-registered ≥2% promote gate. Promoted to the production
+  recommended set; benchmarking note stands (with the flag ON the `[chunks]`
+  metric measures denoise+decode, so per-chunk attribution runs keep it OFF).
+- **P4b cudnn.benchmark**: −0.1% and output bit-identical → cuDNN's heuristic
+  algo choices were already optimal for the decoder's static shapes. Dropped.
+
+**Session result @768:** 46.383 → **48.268** FPS denoise-set (+4.1%), →
+**49.237** with overlap (+6.2%); steady 118.84 → **112.24 ms**. Peak
+15.62→15.64 GiB (+0.02 pooled-K buffers; overlap variant 15.18).
+**@1536:** 12.669 → **13.194** (+4.1%), → **13.435** with overlap.
+**Cumulative vs Step-0 (38.585 FPS):** +25.1% recommended / **+27.6%** with
+overlap; @1536 vs campaign start (11.01): **+22.0%** with overlap.
+**Recommended set (updated):** 2A flags + `FLASHVSR_ATTN_BACKEND=triton2` +
+`FLASHVSR_FUSED_CSR=1` + `FLASHVSR_ROPE_KERNEL=triton` +
+`FLASHVSR_POOLED_K_CACHE=1` + `FLASHVSR_ATTN_ZEROCOPY=1`
+(+ `FLASHVSR_DECODER_OVERLAP=1` for production throughput).
+Interpretation: the denoise side is now deep in diminishing-returns territory
+(attention at 95% of ideal-sparse, GEMMs at 82–85% SOL, FP8 closed by quality,
+rope at BW): P1 was the last mid-size lossless brick and it delivered exactly
+its isolated prediction; P2/P3 confirmed that the remaining copy/pool costs
+were already partially hidden. The E2E ceiling is decode-bound: the decode
+tail is untouched ~540 ms serialized (or ~34% co-executed under overlap) —
+further FPS needs decoder-side work (Phase 4D compile-fusion under the PSNR
+gate) or accepting the ~49–50 FPS plateau @768.
+
+### Phase 6 — Lossless decoder and LQ kernels (2026-07-09)
+
+Fresh Phase-5 production baseline (three-run median, 768x1408 F=81) was
+**49.229 FPS**. Every candidate was toggled independently on the same stack,
+then the cumulative stack was compared bit-for-bit at F=29 and F=89.
+
+- Pointer-state rotation removes 231 recurrent D2D copies (10.54 GiB traffic)
+  without changing decoder state order.
+- Direct output placement removes the serialized final chunk concatenation and
+  skips materializing the three causal warm-up RGB frames.
+- MemBlock Triton pointwise kernels preserve the eager BF16 materialization
+  after bias and residual addition; special-value and E2E tests are bit-exact.
+- The nearest-neighbor kernel reads each channels-last input pixel once and
+  writes four outputs; isolated speedup is 7.7–8.6x on production shapes.
+- The LQ packer changes only `unfold/permute/reshape` materialization. The
+  existing `torch.addmm`, output layout, normalization, and arithmetic remain
+  unchanged; isolated packing speedup is 1.85–2.30x.
+- The recurrent concat kernel packs `[current, past]` in one channels-last
+  pass and is 1.7–1.8x faster in isolation.
+
+**Cumulative result:** 49.229 → **53.423 FPS** (+8.52%) at 768x1408; peak
+allocated memory 15.18 → 15.44 GiB. One phase-closure run at 1536x2560 reached
+**14.684 FPS** versus the previous 13.435 (+9.30%), with 47.76 GiB allocated.
+The post-review strict rerun reached 53.484 FPS at 768x1408 with every expected
+route count satisfied and no recorded fallback.
+`test_phase5_lossless.py phase6` reports `max|diff|=0` at 768x1408 F=29/F=89
+and 1536x2560 F=29/F=41. The `F=29` case confirms direct output matches the
+existing 21-frame cat behavior for accepted `8n+5` inputs. The final profile
+reduced decoder kernel work 518.8 → 393.7 ms
+and decoder launches 3860 → 2969.
+
+Rejected experiments were removed from production code: TGrow packing was
+bit-exact but reduced FPS and added ~0.5 GiB; direct causal LQ packing was
+bit-exact but 0.37% slower; standalone Triton ReLU was slower, while cuDNN's
+fused Conv+ReLU changed BF16 output values.
+
+### Phase 6b — Decoder conv-body campaign (2026-07-09)
+
+Quality budget for this phase (user-approved): **>= 49 dB E2E PSNR** against
+the current stack; bitwise preferred where free. Fresh NCU on the four cuDNN
+decoder conv families showed 75–93% SM/tensor SOL for the MemBlock/transition
+convs (no custom-GEMM headroom) and 42% SOL only for the narrow-N final RGB
+conv. The analyzer now folds `decode0..N` NVTX ranges into a `decode` phase
+and defaults to the true steady window `chunks 3..7`.
+
+- **6b-P1 `FLASHVSR_TCDECODER_TGROW_UP` (keep, lossless):** the three
+  `Upsample(2x) -> TGrow(1x1)` pairs are algebraically reordered: the bias-free
+  1x1 conv runs at LOW resolution (4x fewer FLOPs), then one Triton kernel
+  unpacks the temporal channel groups and nearest-upsamples straight into
+  contiguous channels-last frames (removing the high-res TGrow packing
+  copies). Isolated 2.2x/5.2x/5.4x on the three sites; measured bit-identical
+  E2E at 768x1408 (F=25/29/89) and 1536x2560 (F=25/29/41) — cuDNN picked the
+  same reduction order at both spatial sizes. Production strict 3-run medians:
+  53.40 → **54.61 FPS** (+2.27%).
+- **6b-P2 `FLASHVSR_TCDECODER_CUDNN_FUSED` (keep, quality-gated):** MemBlock
+  chains run as cuDNN runtime-fused `conv+bias+ReLU`, `conv+bias+ReLU`,
+  `conv+bias+residual+ReLU`, and the standalone Conv->ReLU pairs (latent conv,
+  IdentityConv deepening, full-res tail) fuse via
+  `aten.cudnn_convolution_relu`. Replaces the separate exact epilogue kernels
+  (~31 ms/call) with zero extra launches. NOT bit-exact: the fused engine
+  skips the intermediate BF16 materializations (isolated ~70 dB, ~10–14% of
+  values ±1 ULP; E2E **55.4–55.8 dB** vs the lossless stack at both
+  resolutions). Production strict 3-run medians: 54.58 → **55.91 FPS**
+  (+2.44%).
+- **6b-P3 Triton RGB tail conv (drop):** `tl.dot` N=16-padded kernel reached
+  65 dB but 0.351 ms vs cuDNN 0.335 ms on (1,128,1408,768): the formulation
+  re-reads activations 9x through L2 (~2.5 GB/frame) and is L2-bandwidth
+  bound; beating the 42%-SOL sm80 kernel needs an smem-halo design (Gluon),
+  which fails the >=15% isolated bar for this phase.
+
+**Cumulative:** 53.423 → **55.91 FPS** (+4.66%) at 768x1408 F=81 (3-run
+medians). 1536x2560 F=41 single-run spot-checks, all three configs measured
+back-to-back in one same-process-free batch (`runs/phase6b_1536_isolated/`)
+on the same Phase-6 base: baseline **14.36** → +TGROW_UP **14.69**
+(+2.30%, 46.0 → 46.4 GiB) → +both **15.07 FPS** (+4.94% vs this fresh 1536
+baseline, 46.4 GiB unchanged). Note this fresh 14.36 FPS/46.0 GiB baseline
+run differs slightly from the 14.684 FPS / 47.76 GiB number logged at the
+original Phase-6 closure (different session/allocator state); all Phase-6b
+deltas above are same-batch, same-session comparisons and are the numbers to
+trust for this phase. Decoder-stream kernel work 392.0 → **299.9 ms** and
+decoder launches 2969 → **2089** (nsys `phase6b_fused_current` @768, both
+flags on). With `TCDECODER_CUDNN_FUSED=0` the stack remains strictly
+`max|diff|=0` at **54.61 FPS** @768 / **14.69 FPS** @1536. Campaign total
+@768 vs Step 0: 38.585 → 55.91 = **+44.9%** (lossless-only, i.e.
+`CUDNN_FUSED=0`: 38.585 → 54.61 = **+41.5%**).
+
+Next candidates (measured, not yet implemented): DiT residual/LayerNorm/AdaLN
+row fusion (~15.3 ms/chunk budget on the denoise stream, expected +2–4%),
+MemBlock concat elimination via split-K dual `cudnn_convolution_add_relu`
+(~20.6 ms/call concat kernel), true circular K/V arenas (+0.3–0.8%).
+
+### Phase 7 — 60 FPS push (2026-07-09)
+
+Target: 60 FPS at 768x1408 F=81, three-run untraced median, with the
+user-approved >=49 dB E2E PSNR gate. Fresh Phase-6b baseline was **56.085 FPS**
+(55.920 / 56.085 / 56.098); an `nvidia-smi -lgc 1980` A/B was neutral-to-negative
+(56.089 / 56.028 / 55.854, median 56.028), so the default clock policy remains.
+
+- **P7-A `FLASHVSR_DIT_ROW_FUSION` (keep, quality-gated):** a Triton row kernel
+  fuses affine-free LayerNorm -> AdaLN for `norm1`/`norm2`; a second kernel
+  performs the broadcast residual gate. Isolated `8448x1536`: LN+AdaLN
+  0.242 -> 0.026 ms, gate 0.040 -> 0.024 ms. E2E F=25/F=89: 49.78 / 49.88 dB;
+  strict 3-run F=81: 56.085 -> **56.398 FPS** (+0.56%). The large isolated gain
+  is largely hidden by decoder co-execution and warm chunks.
+- **P7-B `FLASHVSR_MASKGEN_THRESHOLD_CACHE` (keep, quality-gated):** the first
+  two per-block geometries retain exact `kthvalue`; later steady chunks reuse
+  the previous threshold. F=89 used 60 exact and 210 cached threshold routes,
+  with 51.72 dB against the prior mask path. It composes with P7-A at 49.60 dB.
+- **P7-C `FLASHVSR_TCDECODER_SPLITK_CONV` (keep, quality-gated):** split the
+  first MemBlock 3x3 weights into current/past halves, pre-cache channels-last
+  views, and use `cudnn_convolution_add_relu`; no recurrent concat is
+  materialized. Isolated three decoder shapes gained 3–10% at ~68.9 dB; F=89
+  E2E was 58.13 dB. A+B+C F=29/F=89 was 49.81 / **49.59 dB**.
+- **Cumulative A+B+C:** **57.256 FPS** (57.256 / 57.213 / 57.358) versus the
+  fresh 56.085 baseline, **+2.09%**. Steady chunks were ~135 ms; peak 15.59 GiB.
+  All expected routes passed under `FLASHVSR_REQUIRE_FASTPATHS=1` with no
+  fallback.
+- **P7-D `FLASHVSR_CONV3D_EINSUM` (drop):** direct strided contraction made
+  isolated conv2 8.39 -> 7.91 ms and passed combined quality at 49.56 dB, but
+  the F=81 A+B+C+D median regressed to **56.741 FPS**. Decoder/DiT co-execution
+  erased the local saving.
+- **P7-E `KV_RINGBUF_SPARE=8` (drop):** removed all 60 F=81 arena compactions
+  and stayed bit-exact at F=89, but its one-run 57.518 FPS probe did not repeat:
+  A+B+C+E three-run median was **57.200 FPS** with peak memory 24.3 GiB
+  (+8.7 GiB). Default spare remains 2.
+
+**Decision:** promote A+B+C to the GH200 preset. The 60 FPS target was not
+reached under the >=49 dB gate: 57.26 FPS leaves 4.8% E2E headroom. Remaining
+material levers are Track-2 attention softmax/WGMMA overlap (high integration
+risk; prior named-barrier attempt was unstable) or an explicitly approved
+quality/algorithm trade in mask density.
+
+### Entry template (copy-paste per attempt)
+
+```markdown
+#### <YYYY-MM-DD HH:MM> · <Phase 2A-1> · <Optimization name>
+
+- Commit / patch:
+- Files changed:
+- Flag: FLASHVSR_<...>  (default OFF)
+- Env vars used (full set):
+- Exact benchmark command:
+- Resolution / frames: 768x1408 / F=81   (spot-check: 1536x2560 y/n)
+- Warmup / steady settings: warmup=1, steady=chunks 2..6 (from [chunks] line)
+- FPS before → after (Δ):            (3-run medians)
+- Steady chunk before → after (Δ):
+- Peak mem before → after:
+- Correctness: (max|diff| == 0 | PSNR = XX.X dB | mask-equality | n/a)
+- Output difference (if applicable):
+- Nsight report path (if generated):
+- Decision: keep-enabled | keep-behind-flag | revert | investigate | postpone
+- Interpretation (2–3 sentences, mandatory): did it match the roadmap
+  estimate? why / why not? what follows?
+```
+
+---
+
+## Phase 2A closure summary (2026-07-08)
+
+- All of 2A-1..2A-5 landed with flag + log entry + interpretation +
+  correctness result; 2A-6 evaluated and postponed via its go/no-go gate.
+- Kept enabled (recommended set): `FUSE_ROPE`, `KV_RINGBUF`,
+  `ATTN_STRIDED_IO`, `MASKGEN_LEAN`, `LQPROJ_LEAN`. Kept behind flag:
+  `CACHE_ROPE_FREQS` (FPS-neutral @768, lossless, graph-capture prereq).
+  Rejected during development: LQPROJ sub-item (b) (non-contiguous GEMM
+  output → 49.9 dB, fails the lossless gate).
+- Combined-stack parity: `test_phase2a_lossless.py ALL` → max|diff| == 0 vs
+  all-flags-OFF (no flag interactions).
+- Result @768x1408: 38.585 → 41.580 FPS (+7.8%), steady chunk 156.28 →
+  138.46 ms (−17.8 ms); roadmap ceiling for 2A was ~20–26 ms — the gap is the
+  traced-CPU rope_freqs share (rides under GPU work untraced) and the
+  deliberately-skipped deep fusions (2B-3 mask topk, 2B-4 im2col).
+- @1536x2560 spot-check recorded below; peak-mem cost of the arena documented.
+- Recommended next (Phase 2B): decoder overlap (2B-1) first — decode is still
+  a fully serialized 17–23% of E2E; then FP8 GEMM infra (2B-2, default-OFF),
+  fused mask top-k (2B-3), fused im2col (2B-4, still eligible since 2A-5
+  recovered <2 ms).
+
+## Cumulative stack
+
+<!-- Update whenever a flag joins/leaves the recommended set.
+     "Delta vs Phase-2 Baseline" compares against the Step-0 median. -->
+
+| Step | Enabled Optimizations | FPS | Steady Chunk Time | Peak Memory | Delta vs Phase-2 Baseline | Notes |
+|------|----------------------|-----|-------------------|-------------|---------------------------|-------|
+| 0 | full-knobs baseline (gemm+NHWC+fuse_norm+triton+TMA+caches) | 38.585 | 156.28 ms | 12.6 GiB | — | Step-0 fresh baseline (2026-07-08, df94d94) |
+| 1 | baseline + FUSE_ROPE | 39.023 | 153.62 ms | 12.6 GiB | +1.14% FPS / −2.66 ms | 2A-1b, lossless |
+| 2 | + KV_RINGBUF | 39.429 | 150.76 ms | 15.5 GiB | +2.19% FPS / −5.52 ms | 2A-2, lossless; +2.9 GiB arena slack |
+| 3 | + ATTN_STRIDED_IO | 41.099 | 141.14 ms | 15.5 GiB | +6.52% FPS / −15.14 ms | 2A-3, lossless |
+| 4 | + MASKGEN_LEAN | 41.477 | 139.00 ms | 15.5 GiB | +7.50% FPS / −17.28 ms | 2A-4, exact mask |
+| 5 | + LQPROJ_LEAN | 41.580 | 138.46 ms | 15.62 GiB | +7.76% FPS / −17.82 ms | 2A-5, lossless |
+| 6 | + DECODER_OVERLAP (kept behind flag, not in default set) | 42.373 | 190.58 ms (denoise+decode) | 15.16 GiB | +9.82% FPS vs Step 0 / +1.71% vs Step 5 | 2B-1, lossless; steady-chunk metric absorbs decode when ON — later per-chunk benchmarking stays flag-OFF; decode tail 561→125 ms |
+| 7 | 2A set + ATTN_BACKEND=**triton2** (kept behind flag pending confirmation entry) | 45.466 | 122.06 ms | 15.62 GiB | +17.83% FPS vs Step 0 / +9.05% vs the 2A set | Phase 3 attention v2; PSNR 50.03 dB vs sparse (same class as `triton`'s ~49.7); composes with all 2A flags |
+| 8 | + FFMA-softmax (3.5-1a, in triton2) + **FUSED_CSR** | 46.383 | 118.84 ms | 15.62 GiB | +20.2% FPS vs Step 0 / +11.68% vs the 2A set | Phase 3.5 exact-math pack; both lossless-class (PSNR 50.08 / bit-eq CSR); @1536 +10.5% |
+| 9 | + ROPE_KERNEL=triton + POOLED_K_CACHE + ATTN_ZEROCOPY | 48.268 | 112.24 ms | 15.64 GiB | **+25.1%** FPS vs Step 0 | Phase 5 P1-P3, all bit-exact (max\|diff\|=0) |
+| 10 | + DECODER_OVERLAP (production set) | **49.237** | 164.88 ms (denoise+decode) | 15.18 GiB | **+27.6%** FPS vs Step 0 | P4a: overlap re-promoted at +2.01% on the shorter chunk; keep OFF for per-chunk attribution runs |
+| 11 | + Phase-6 pointer/direct-output/pointwise/upsample/LQ-packer/concat | **53.423** | overlap metric | 15.44 GiB | **+38.5%** FPS vs Step 0 / +8.52% vs fresh Phase-5 | All Phase-6 paths bit-identical vs Phase-5 production |
+| 12 | + `TCDECODER_TGROW_UP` (Phase 6b, lossless) | **54.61** | overlap metric | 15.6 GiB | **+41.5%** FPS vs Step 0 | bit-identical incl. 1536 F=25/29/41 |
+| 13 | + `TCDECODER_CUDNN_FUSED` (Phase 6b, quality-gated) | **55.91** | overlap metric | 15.6 GiB | **+44.9%** FPS vs Step 0 | E2E 55.4 dB PSNR vs Step 12 (gate 49 dB) |
+| 14 | + P7 `DIT_ROW_FUSION` + `MASKGEN_THRESHOLD_CACHE` + `TCDECODER_SPLITK_CONV` | **57.256** | overlap metric | 15.59 GiB | **+48.4%** FPS vs Step 0 / +2.41% vs Step 13 | Combined F=29/F=89 PSNR 49.81/49.59 dB vs Step 13 (gate 49 dB) |
+
+---
+
+## Phase closure spot-checks (@1536x2560)
+
+| Date | Phase closed | Enabled set | FPS @1536 | Steady chunk @1536 | Peak mem @1536 | Notes |
+|------|--------------|-------------|-----------|--------------------|----------------|-------|
+| 2026-07-08 | 2A | full-knobs + FUSE_ROPE + KV_RINGBUF + ATTN_STRIDED_IO + MASKGEN_LEAN + LQPROJ_LEAN | 11.489 | 501.92 ms | 48.39 GiB | Phase-1 ref: 11.01 / 531.5 ms / 37.4 GiB → +4.35% FPS, −29.6 ms; +11 GiB = arena spare slots at this res (`FLASHVSR_KV_RINGBUF_SPARE` trades it back). Gain smaller than @768 (+7.8%) as attention/decode share grows with res — consistent with ANALYSIS §0. |
+| 2026-07-08 | 3 | 2A set + ATTN_BACKEND=triton2 (OFF ref same session: 11.472 / 503.22 ms / 48.39 GiB) | 12.436 | 449.24 ms | 48.39 GiB | Phase-3 attention v2 spot-check: +8.4% FPS, −53.98 ms/chunk, peak unchanged — the kernel win holds at scale (attention share scale-invariant, ANALYSIS §0). |
+| 2026-07-08 | 3.5 | 2A set + triton2 + FUSED_CSR (OFF ref same session: 11.461 / 503.38 ms) | 12.669 | 438.20 ms | 48.39 GiB | Phase-3.5 spot-check: +10.5% FPS, −65.2 ms/chunk vs OFF — FFMA-softmax + fused CSR hold/grow at scale. |
+| 2026-07-08 | 5 | + ROPE_KERNEL + POOLED_K_CACHE + ATTN_ZEROCOPY | 13.194 | 414.32 ms | 48.49 GiB | Phase-5 P1-P3 spot: +4.1% vs Phase-3.5 set. With +DECODER_OVERLAP: **13.435 FPS** / 46.82 GiB — campaign total @1536: 11.01 → 13.44 (**+22.0%**). |
+| 2026-07-09 | 6 | Phase-5 production + all Phase-6 lossless paths | **14.684** | 527.7 ms median (decode overlap included) | 47.76 GiB | Single phase-closure run, strict fast paths; +9.30% vs Phase-5 production. F=41 parity max\|diff\|=0. |
+| 2026-07-09 | 6b | Same-batch baseline → +`TGROW_UP` → +`CUDNN_FUSED` | 14.36 → 14.69 → **15.07** | — | 46.0 → 46.4 → 46.4 GiB | Three single strict runs, same session/batch; TGROW_UP bit-identical @1536 (+2.30%), CUDNN_FUSED 55.7–55.8 dB E2E PSNR (+2.59% more). Combined +4.94% vs this fresh baseline. |
+| 2026-07-09 | 7 | Phase-6b + `DIT_ROW_FUSION` + `MASKGEN_THRESHOLD_CACHE` + `TCDECODER_SPLITK_CONV` | **15.415** | 641.1 ms (chunk 2 single spot) | 46.46 GiB | Strict F=41 spot, +2.3% vs the 15.07 Phase-6b reference. Combined F=29 quality gate: 49.95 dB vs the Phase-6b production stack. |

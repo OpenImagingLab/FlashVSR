@@ -19,3 +19,13 @@ venv/
 # IDE files
 .vscode/
 .idea/
+
+# FlashVSR model weights & outputs (examples)
+examples/WanVSR/FlashVSR/
+examples/WanVSR/FlashVSR-v1.1/
+examples/WanVSR/results/
+
+# Profiling artifacts (reports/caches/raw runs are large binaries)
+examples/WanVSR/profiling/reports/
+examples/WanVSR/profiling/cache/
+examples/WanVSR/profiling/runs/

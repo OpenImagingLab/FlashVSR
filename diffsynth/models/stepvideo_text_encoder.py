@@ -18,7 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .stepvideo_dit import RMSNorm
 from safetensors.torch import load_file
-from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+try:
+    from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+except ImportError:  # newer transformers no longer re-exports PretrainedConfig from modeling_utils
+    from transformers.modeling_utils import PreTrainedModel
+    from transformers import PretrainedConfig
 from einops import rearrange
 import json
 from typing import List
