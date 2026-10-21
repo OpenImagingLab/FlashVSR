@@ -1,0 +1,18 @@
+# Install matching ROCm torch/torchvision/torchaudio separately.
+# Inference dependencies from the validated environment.
+torchsde==0.2.6
+accelerate==1.15.0
+einops==0.8.2
+huggingface-hub==1.33.0
+numpy==2.5.4
+opencv-python-headless==4.11.0.86
+peft==0.21.2
+pillow==12.3.0
+safetensors==0.8.0
+sentencepiece==0.2.2
+transformers==5.17.0
+imageio==2.38.1
+imageio-ffmpeg==0.6.0
+protobuf==7.36.1
+ftfy==6.1.1
+tqdm==4.70.1
