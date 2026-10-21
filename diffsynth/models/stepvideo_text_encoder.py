@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .stepvideo_dit import RMSNorm
 from safetensors.torch import load_file
-from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 from einops import rearrange
 import json
 from typing import List

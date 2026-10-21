@@ -269,6 +269,18 @@ class TAEHV(nn.Module):
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Decoder-only model: call decode_video(...) instead.")
 
+    def set_rocm_cache_release(self, enabled=True):
+        """Release allocator cache at decoder block boundaries on ROCm."""
+        for handle in getattr(self, "_rocm_cache_handles", []):
+            handle.remove()
+        self._rocm_cache_handles = []
+        if enabled and torch.version.hip:
+            for module in self.decoder.modules():
+                if isinstance(module, MemBlock):
+                    self._rocm_cache_handles.append(module.register_forward_hook(
+                        lambda module, inputs, output: torch.cuda.empty_cache()
+                    ))
+
     def clean_mem(self):
         self.mem = [None] * len(self.decoder)
 

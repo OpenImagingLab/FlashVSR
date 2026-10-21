@@ -171,22 +171,23 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
 
     raise ValueError(f"Unsupported input: {path}")
 
-def init_pipeline():
+def init_pipeline(model_dir="./FlashVSR-v1.1"):
+    model_dir = os.fspath(model_dir)
     print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([
-        "./FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors",
+        os.path.join(model_dir, "diffusion_pytorch_model_streaming_dmd.safetensors"),
     ])
     pipe = FlashVSRTinyPipeline.from_model_manager(mm, device="cuda")
     pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
-    LQ_proj_in_path = "./FlashVSR-v1.1/LQ_proj_in.ckpt"
+    LQ_proj_in_path = os.path.join(model_dir, "LQ_proj_in.ckpt")
     if os.path.exists(LQ_proj_in_path):
-        pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu"), strict=True)
+        pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu", weights_only=True), strict=True)
     pipe.denoising_model().LQ_proj_in.to('cuda')
 
     multi_scale_channels = [512, 256, 128, 128]
     pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
-    mis = pipe.TCDecoder.load_state_dict(torch.load("./FlashVSR-v1.1/TCDecoder.ckpt"), strict=False)
+    mis = pipe.TCDecoder.load_state_dict(torch.load(os.path.join(model_dir, "TCDecoder.ckpt")), strict=False)
     print(mis)
 
     pipe.to('cuda'); pipe.enable_vram_management(num_persistent_param_in_dit=None)
@@ -204,7 +205,7 @@ def main():
     ]
     seed, scale, dtype, device = 0, 4.0, torch.bfloat16, 'cuda'
     sparse_ratio = 2.0      # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
-    pipe = init_pipeline()
+    pipe = init_pipeline(os.environ.get("FLASHVSR_MODEL_DIR", "./FlashVSR-v1.1"))
 
     for p in inputs:
         torch.cuda.empty_cache(); torch.cuda.ipc_collect()

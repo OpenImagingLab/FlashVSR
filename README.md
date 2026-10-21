@@ -83,6 +83,8 @@ Thanks again to the community for actively testing and helping improve FlashVSR 
 
 ---
 
+AMD GPU users: see [ROCm inference and validation](ROCM.md) for the optional ROCm setup.
+
 ### 🚀 Getting Started
 
 Follow these steps to set up and run **FlashVSR** on your local machine:
