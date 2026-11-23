@@ -43,6 +43,9 @@ Thanks to the community for the fast adoption of FlashVSR! Below are some third-
 - **WanVideoWrapper** — integrated support but currently has known issues  
   https://github.com/kijai/ComfyUI-WanVideoWrapper/issues/1441
 
+**Apple Silicon**
+- **[HerRei/flashvsr-mlx](https://github.com/HerRei/flashvsr-mlx)** — MLX port of the v1.1 Tiny pipeline for Macs, with a Metal kernel for the sparse attention; outputs checked against this repository's PyTorch pipeline
+
 **Cloud / API Deployments**  
 (These third-party services offer ready-to-use online inference, making it easy to try FlashVSR without any setup or GPU requirements. However, it’s unclear whether they run v1 or v1.1 or whether the full pipeline is implemented, so results may differ from the official version. 🤷‍♂️ For the most accurate and complete reproduction, we recommend using the official repository when possible.)
 
